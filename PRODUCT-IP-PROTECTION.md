@@ -1630,3 +1630,787 @@ def get_customer_metrics(customer_id):
 - ℹ️  Customer gets clear error messages about license/integrity issues
 
 
+# Product IP Protection & Kill Switch - Visual Architecture
+
+## Diagram 1: Overall System Architecture
+
+```mermaid
+graph TB
+    subgraph "Your Infrastructure"
+        A[Your Build Pipeline] --> B[Image Registry]
+        A --> C[License Server]
+        B --> D[Signed Images<br/>+ SBOM + Attestations]
+        C --> E[License Generation<br/>& Validation API]
+    end
+    
+    subgraph "Customer AWS Account"
+        subgraph "Lambda Functions"
+            F1[Lambda 1<br/>Auth Service]
+            F2[Lambda 2<br/>Payment Service]
+            F3[Lambda 3<br/>Notification]
+        end
+        
+        subgraph "EKS Cluster"
+            K1[API Service<br/>Pod]
+            K2[Worker Service<br/>Pod]
+            K3[Database Service<br/>Pod]
+        end
+        
+        subgraph "Protection Layer"
+            G[Validation Agent<br/>Deployment]
+            H[Init Containers<br/>Pre-validation]
+            I[Sidecar Containers<br/>Continuous Monitoring]
+        end
+        
+        J[Customer ECR]
+    end
+    
+    D -->|Push Signed Images| J
+    E -->|Validate License| G
+    E -->|Validate License| H
+    E -->|Validate License| I
+    
+    J -->|Pull Images| F1
+    J -->|Pull Images| F2
+    J -->|Pull Images| F3
+    J -->|Pull Images| K1
+    J -->|Pull Images| K2
+    J -->|Pull Images| K3
+    
+    G -->|Monitor & Control| F1
+    G -->|Monitor & Control| F2
+    G -->|Monitor & Control| F3
+    G -->|Monitor & Control| K1
+    G -->|Monitor & Control| K2
+    G -->|Monitor & Control| K3
+    
+    H -->|Pre-validate| K1
+    H -->|Pre-validate| K2
+    H -->|Pre-validate| K3
+    
+    I -->|Continuous Check| K1
+    I -->|Continuous Check| K2
+    I -->|Continuous Check| K3
+    
+    G -->|Kill Switch<br/>Notification| E
+    
+    style A fill:#e1f5ff
+    style C fill:#e1f5ff
+    style E fill:#e1f5ff
+    style G fill:#ffe1e1
+    style H fill:#ffe1e1
+    style I fill:#ffe1e1
+```
+
+---
+
+## Diagram 2: Image Build & Protection Flow
+
+```mermaid
+sequenceDiagram
+    participant Dev as Developer
+    participant CI as CI/CD Pipeline
+    participant KMS as AWS KMS
+    participant Reg as Your Registry
+    participant Sign as Cosign
+    participant SBOM as Syft SBOM
+    participant Att as in-toto
+    
+    Dev->>CI: Push Code
+    CI->>CI: Build Docker Image
+    
+    rect rgb(200, 230, 255)
+        Note over CI,Sign: Image Protection Phase
+        CI->>Sign: Sign Image
+        Sign->>KMS: Use Signing Key
+        KMS-->>Sign: Sign with Private Key
+        Sign-->>CI: Signature Created
+        
+        CI->>SBOM: Generate SBOM
+        SBOM-->>CI: SBOM (SPDX/CycloneDX)
+        CI->>Sign: Attach & Sign SBOM
+        
+        CI->>Att: Create Attestation
+        Att-->>CI: Build Attestation
+    end
+    
+    rect rgb(255, 230, 200)
+        Note over CI,Reg: Verification Phase
+        CI->>CI: Scan for Vulnerabilities
+        CI->>CI: Calculate Image Digest
+        CI->>CI: Generate Checksums
+    end
+    
+    CI->>Reg: Push Protected Image
+    Reg-->>CI: Image Pushed
+    
+    Note over Reg: Image is now:<br/>✓ Signed<br/>✓ SBOM Attached<br/>✓ Attested<br/>✓ Scanned
+```
+
+---
+
+## Diagram 3: Customer Onboarding & License Generation
+
+```mermaid
+sequenceDiagram
+    participant Sales as Sales Team
+    participant LS as License Server
+    participant DB as License Database
+    participant Cust as Customer AWS
+    participant ECR as Customer ECR
+    participant K8s as Customer EKS
+    
+    Sales->>LS: Create Customer License
+    
+    rect rgb(230, 255, 230)
+        Note over LS,DB: License Generation
+        LS->>LS: Generate JWT Token
+        LS->>LS: Embed Allowed Image Digests
+        LS->>LS: Set Expiration Date
+        LS->>LS: Add Customer ID
+        LS->>DB: Store License Record
+    end
+    
+    LS-->>Sales: License Key Generated
+    
+    Sales->>Cust: Provide License Key
+    Sales->>Cust: Deployment Scripts
+    
+    rect rgb(255, 240, 200)
+        Note over Cust,K8s: Infrastructure Setup
+        Cust->>ECR: Create ECR Repositories
+        Cust->>K8s: Create EKS Cluster
+        Cust->>K8s: Create Namespaces
+    end
+    
+    rect rgb(255, 200, 200)
+        Note over Cust,K8s: Protection Deployment
+        Cust->>K8s: Deploy Validation Agent
+        Cust->>K8s: Store License in Secret
+        Cust->>K8s: Store Cosign Public Key
+    end
+    
+    Sales->>ECR: Push Signed Images
+    ECR-->>Sales: Images Available
+    
+    Note over Cust: Customer Ready to Deploy Product
+```
+
+---
+
+## Diagram 4: Lambda Function Deployment & Validation
+
+```mermaid
+flowchart TD
+    Start([Deploy Lambda Function]) --> Sign{Verify Image<br/>Signature?}
+    
+    Sign -->|Invalid| Stop1[❌ Deployment Failed]
+    Sign -->|Valid| Digest[Extract Image Digest]
+    
+    Digest --> Deploy[Deploy Lambda with<br/>Environment Variables]
+    
+    Deploy --> Env[Set ENV Variables:<br/>- PRODUCT_ID<br/>- CUSTOMER_ID<br/>- LICENSE_KEY<br/>- IMAGE_DIGEST<br/>- VALIDATION_ENDPOINT]
+    
+    Env --> Cold[Lambda Cold Start]
+    
+    Cold --> Val{Validation<br/>Layer Runs}
+    
+    Val --> Check1{License<br/>Valid?}
+    Check1 -->|No| Kill1[❌ Lambda Fails<br/>RuntimeError]
+    Check1 -->|Yes| Check2{Image Digest<br/>Matches?}
+    
+    Check2 -->|No| Kill2[❌ Lambda Fails<br/>Tampering Detected]
+    Check2 -->|Yes| Check3{License<br/>Expired?}
+    
+    Check3 -->|Yes| Kill3[❌ Lambda Fails<br/>License Expired]
+    Check3 -->|No| Success[✅ Lambda Runs]
+    
+    Success --> Invoke[Process Request]
+    
+    Invoke --> Monitor[Validation Agent<br/>Monitors Periodically]
+    
+    Monitor --> Recheck{Every 5 Min:<br/>Still Valid?}
+    Recheck -->|Yes| Invoke
+    Recheck -->|No| Disable[🚨 Kill Switch:<br/>Disable Lambda]
+    
+    style Sign fill:#ffe6e6
+    style Val fill:#ffe6e6
+    style Monitor fill:#fff4e6
+    style Success fill:#e6ffe6
+    style Kill1 fill:#ff4444,color:#fff
+    style Kill2 fill:#ff4444,color:#fff
+    style Kill3 fill:#ff4444,color:#fff
+    style Disable fill:#ff4444,color:#fff
+```
+
+---
+
+## Diagram 5: Kubernetes Pod Deployment with Protection
+
+```mermaid
+sequenceDiagram
+    participant K8s as Kubernetes API
+    participant Init as Init Container
+    participant LS as License Server
+    participant Side as Sidecar Container
+    participant Main as Main Application
+    participant Probe as Liveness Probe
+    
+    K8s->>Init: Start Init Container
+    
+    rect rgb(255, 230, 230)
+        Note over Init,LS: Pre-Deployment Validation
+        Init->>LS: Validate License
+        LS-->>Init: License Status
+        
+        Init->>Init: Verify Image Signature
+        Init->>Init: Check Image Digest
+        
+        alt Validation Failed
+            Init->>Init: Write "failed" to /validation/status
+            Init-->>K8s: Init Failed (Exit 1)
+            K8s->>K8s: ❌ Pod Creation Failed
+        else Validation Passed
+            Init->>Init: Write "validated" to /validation/status
+            Init-->>K8s: Init Success (Exit 0)
+        end
+    end
+    
+    rect rgb(230, 255, 230)
+        Note over Side,Main: Container Startup
+        K8s->>Side: Start Sidecar Container
+        K8s->>Main: Start Main Container
+        
+        par Parallel Execution
+            Side->>Side: Start Health Endpoint :9090
+            Side->>Side: Start Validation Loop
+            and
+            Main->>Main: Read /validation/status
+            Main->>Main: Start Application
+        end
+    end
+    
+    rect rgb(230, 240, 255)
+        Note over Side,Probe: Continuous Monitoring
+        loop Every 5 Minutes
+            Side->>LS: Validate License
+            LS-->>Side: License Valid/Invalid
+            Side->>Side: Verify Image Signature
+            Side->>Side: Check Image Digest
+            
+            alt Validation Failed
+                Side->>Side: Set healthy = false
+                Side->>Side: Write "failed" to /validation/status
+                Side->>LS: Send Kill Switch Notification
+                Side->>Main: Send SIGTERM
+                Side->>Side: 🚨 Exit (Kill Switch)
+                Main->>Main: ❌ Shutdown
+                Probe->>Side: Health Check
+                Side-->>Probe: 503 Unhealthy
+                Probe->>K8s: Pod Unhealthy
+                K8s->>K8s: Restart Pod
+            else Validation Passed
+                Side->>Side: ✅ Continue Monitoring
+                Probe->>Main: Check /validation/status
+                Main-->>Probe: "validated"
+                Probe->>Side: Health Check :9090
+                Side-->>Probe: 200 Healthy
+            end
+        end
+    end
+```
+
+---
+
+## Diagram 6: Kill Switch Activation Flow
+
+```mermaid
+flowchart TD
+    Start([Validation Agent Running]) --> Check[Every 5 Minutes:<br/>Validation Check]
+    
+    Check --> License{Validate<br/>License}
+    
+    License -->|Valid| Images{Get Running<br/>Images}
+    License -->|Invalid| Violation1[Record Violation:<br/>License Invalid]
+    
+    Images --> Compare{Compare Digests<br/>with Licensed List}
+    
+    Compare -->|Match| Signatures{Verify<br/>Signatures}
+    Compare -->|Mismatch| Violation2[Record Violation:<br/>Unauthorized Image]
+    
+    Signatures -->|Valid| Success[✅ All Checks Passed]
+    Signatures -->|Invalid| Violation3[Record Violation:<br/>Signature Mismatch]
+    
+    Success --> Wait[Wait 5 Minutes]
+    Wait --> Check
+    
+    Violation1 --> Trigger[🚨 TRIGGER KILL SWITCH]
+    Violation2 --> Trigger
+    Violation3 --> Trigger
+    
+    Trigger --> Action1[Disable All Lambda Functions]
+    Trigger --> Action2[Scale K8s Deployments to 0]
+    Trigger --> Action3[Send Notification to License Server]
+    
+    Action1 --> Lambda1[Update Lambda 1<br/>ENV: PRODUCT_DISABLED=true]
+    Action1 --> Lambda2[Update Lambda 2<br/>ENV: PRODUCT_DISABLED=true]
+    Action1 --> Lambda3[Update Lambda N<br/>ENV: PRODUCT_DISABLED=true]
+    
+    Action2 --> K8s1[Scale Deployment 1 to 0]
+    Action2 --> K8s2[Scale Deployment 2 to 0]
+    Action2 --> K8s3[Scale Deployment N to 0]
+    
+    Action3 --> Notify[POST /api/v1/kill-switch<br/>with Violation Details]
+    
+    Notify --> Alert1[📧 Email Alert to Your Team]
+    Notify --> Alert2[📱 Slack Notification]
+    Notify --> Alert3[📊 Dashboard Update]
+    
+    Lambda1 --> End1[❌ Product Stopped]
+    Lambda2 --> End1
+    Lambda3 --> End1
+    K8s1 --> End1
+    K8s2 --> End1
+    K8s3 --> End1
+    Alert1 --> End1
+    Alert2 --> End1
+    Alert3 --> End1
+    
+    style Check fill:#e6f3ff
+    style License fill:#fff4e6
+    style Images fill:#fff4e6
+    style Compare fill:#fff4e6
+    style Signatures fill:#fff4e6
+    style Success fill:#e6ffe6
+    style Trigger fill:#ff4444,color:#fff
+    style End1 fill:#ff4444,color:#fff
+    style Violation1 fill:#ffcccc
+    style Violation2 fill:#ffcccc
+    style Violation3 fill:#ffcccc
+```
+
+---
+
+## Diagram 7: License Validation Sequence
+
+```mermaid
+sequenceDiagram
+    participant VA as Validation Agent
+    participant LS as License Server
+    participant DB as License Database
+    participant JWT as JWT Decoder
+    participant Log as Audit Log
+    
+    VA->>LS: POST /api/v1/validate
+    Note over VA,LS: Request Body:<br/>- customer_id<br/>- product_id<br/>- license_key (JWT)<br/>- image_digest
+    
+    rect rgb(240, 240, 255)
+        Note over LS,JWT: License Verification
+        LS->>LS: Verify Request Signature
+        LS->>JWT: Decode JWT Token
+        JWT->>JWT: Verify Signature
+        JWT->>JWT: Check Algorithm (HS256)
+        JWT-->>LS: Decoded License Data
+        
+        LS->>LS: Verify Customer ID
+        LS->>LS: Verify Product ID
+        LS->>LS: Check Expiration Date
+        LS->>LS: Verify Image Digest in Allowed List
+    end
+    
+    rect rgb(240, 255, 240)
+        Note over LS,DB: Database Check
+        LS->>DB: Query License Record
+        DB-->>LS: License Details
+        LS->>DB: Check Revocation Status
+        DB-->>LS: Not Revoked
+    end
+    
+    rect rgb(255, 250, 230)
+        Note over LS,Log: Audit Logging
+        LS->>Log: Log Validation Request
+        Log->>Log: Store:<br/>- Timestamp<br/>- Customer ID<br/>- IP Address<br/>- Result
+    end
+    
+    alt All Checks Passed
+        LS-->>VA: 200 OK
+        Note over LS,VA: Response:<br/>- status: "valid"<br/>- expiration<br/>- allowed_images<br/>- features
+        VA->>VA: ✅ Continue Operation
+    else License Invalid
+        LS-->>VA: 403 Forbidden
+        Note over LS,VA: Response:<br/>- error: "Invalid license"
+        VA->>VA: 🚨 Trigger Kill Switch
+    else License Expired
+        LS-->>VA: 403 Forbidden
+        Note over LS,VA: Response:<br/>- error: "License expired"
+        VA->>VA: 🚨 Trigger Kill Switch
+    else Unauthorized Image
+        LS-->>VA: 403 Forbidden
+        Note over LS,VA: Response:<br/>- error: "Unauthorized image"
+        VA->>VA: 🚨 Trigger Kill Switch
+    end
+```
+
+---
+
+## Diagram 8: Image Integrity Verification Process
+
+```mermaid
+flowchart TD
+    Start([Periodic Integrity Check]) --> GetImages[Get Running Images]
+    
+    GetImages --> Lambda{Get Lambda<br/>Functions}
+    GetImages --> K8s{Get K8s<br/>Pods}
+    
+    Lambda --> ExtractL[Extract Lambda Image URIs<br/>Filter by ProductId Tag]
+    K8s --> ExtractK[Extract Pod Image URIs<br/>Filter by Product Label]
+    
+    ExtractL --> ParseL[Parse Image Digest<br/>from URI]
+    ExtractK --> ParseK[Parse Image Digest<br/>from URI]
+    
+    ParseL --> List[Compile Running<br/>Image List]
+    ParseK --> List
+    
+    List --> Licensed{Get Licensed<br/>Images from<br/>License Server}
+    
+    Licensed --> Compare[Compare Each Running Image]
+    
+    Compare --> Loop{For Each<br/>Running Image}
+    
+    Loop --> Check1{Digest in<br/>Licensed List?}
+    
+    Check1 -->|No| Viol1[❌ Violation:<br/>Unauthorized Image]
+    Check1 -->|Yes| Check2{Verify<br/>Cosign Signature}
+    
+    Check2 -->|Failed| Viol2[❌ Violation:<br/>Signature Invalid]
+    Check2 -->|Success| Check3{Verify<br/>SBOM Signature}
+    
+    Check3 -->|Failed| Viol3[⚠️ Warning:<br/>SBOM Missing/Invalid]
+    Check3 -->|Success| Check4{Compare<br/>Manifest Checksum}
+    
+    Check4 -->|Mismatch| Viol4[❌ Violation:<br/>Image Modified]
+    Check4 -->|Match| Valid[✅ Image Verified]
+    
+    Valid --> More{More Images<br/>to Check?}
+    More -->|Yes| Loop
+    More -->|No| Decision{Any<br/>Violations?}
+    
+    Viol1 --> Collect[Collect All Violations]
+    Viol2 --> Collect
+    Viol3 --> Collect
+    Viol4 --> Collect
+    
+    Collect --> Decision
+    
+    Decision -->|Yes| Kill[🚨 TRIGGER KILL SWITCH]
+    Decision -->|No| Success[✅ All Images Valid]
+    
+    Success --> Wait[Wait 5 Minutes]
+    Wait --> Start
+    
+    Kill --> Shutdown[Shutdown All Product<br/>Components]
+    Shutdown --> Notify[Notify License Server]
+    Notify --> End([❌ Product Stopped])
+    
+    style Check1 fill:#fff4e6
+    style Check2 fill:#fff4e6
+    style Check3 fill:#fff4e6
+    style Check4 fill:#fff4e6
+    style Valid fill:#e6ffe6
+    style Success fill:#e6ffe6
+    style Viol1 fill:#ffcccc
+    style Viol2 fill:#ffcccc
+    style Viol3 fill:#ffffcc
+    style Viol4 fill:#ffcccc
+    style Kill fill:#ff4444,color:#fff
+    style End fill:#ff4444,color:#fff
+```
+
+---
+
+## Diagram 9: Multi-Layer Security Protection
+
+```mermaid
+graph LR
+    subgraph "Layer 1: Build Time"
+        A1[Source Code] --> A2[Docker Build]
+        A2 --> A3[Vulnerability Scan]
+        A3 --> A4[Image Signing<br/>Cosign + KMS]
+        A4 --> A5[SBOM Generation<br/>Syft]
+        A5 --> A6[in-toto Attestation]
+    end
+    
+    subgraph "Layer 2: Storage"
+        B1[ECR Encryption]
+        B2[Image Immutability]
+        B3[Lifecycle Policies]
+        B4[Access Control]
+    end
+    
+    subgraph "Layer 3: Deployment"
+        C1[Signature Verification]
+        C2[SBOM Verification]
+        C3[License Validation]
+        C4[Init Container Check]
+        C5[Admission Webhook]
+    end
+    
+    subgraph "Layer 4: Runtime"
+        D1[Sidecar Monitoring]
+        D2[Continuous Validation]
+        D3[Digest Verification]
+        D4[Network Policies]
+        D5[Kill Switch]
+    end
+    
+    subgraph "Layer 5: Monitoring"
+        E1[Prometheus Alerts]
+        E2[Audit Logging]
+        E3[License Server Telemetry]
+        E4[Compliance Dashboard]
+    end
+    
+    A6 --> B1
+    B4 --> C1
+    C5 --> D1
+    D5 --> E1
+    
+    style A4 fill:#e1f5ff
+    style A5 fill:#e1f5ff
+    style A6 fill:#e1f5ff
+    style C1 fill:#ffe1e1
+    style C2 fill:#ffe1e1
+    style C3 fill:#ffe1e1
+    style D1 fill:#fff4e6
+    style D2 fill:#fff4e6
+    style D5 fill:#ff4444,color:#fff
+```
+
+---
+
+## Diagram 10: Complete End-to-End Flow
+
+```mermaid
+sequenceDiagram
+    participant Dev as Developer
+    participant CI as CI/CD
+    participant Reg as Your Registry
+    participant LS as License Server
+    participant Cust as Customer
+    participant CECR as Customer ECR
+    participant VA as Validation Agent
+    participant Lambda as Lambda
+    participant K8s as Kubernetes Pod
+    
+    rect rgb(230, 240, 255)
+        Note over Dev,Reg: Phase 1: Build & Sign
+        Dev->>CI: Push Code
+        CI->>CI: Build Image
+        CI->>CI: Scan Vulnerabilities
+        CI->>CI: Sign with Cosign
+        CI->>CI: Generate SBOM
+        CI->>CI: Create Attestations
+        CI->>Reg: Push Protected Image
+    end
+    
+    rect rgb(240, 255, 240)
+        Note over LS,Cust: Phase 2: Customer Onboarding
+        LS->>LS: Generate License
+        LS->>Cust: Provide License + Credentials
+        Cust->>CECR: Create ECR
+        Reg->>CECR: Push Signed Images
+        Cust->>Cust: Deploy Validation Agent
+    end
+    
+    rect rgb(255, 240, 230)
+        Note over VA,K8s: Phase 3: Initial Deployment
+        Cust->>K8s: Deploy Pod (Init Container)
+        K8s->>LS: Validate License
+        LS-->>K8s: License Valid
+        K8s->>K8s: Verify Signature
+        K8s->>K8s: Start Main Container
+        
+        Cust->>Lambda: Deploy Lambda
+        Lambda->>LS: Validate License
+        LS-->>Lambda: License Valid
+        Lambda->>Lambda: Verify Digest
+        Lambda->>Lambda: Start Function
+    end
+    
+    rect rgb(255, 230, 230)
+        Note over VA,K8s: Phase 4: Continuous Monitoring
+        loop Every 5 Minutes
+            VA->>LS: Validate License
+            LS-->>VA: Valid/Invalid
+            VA->>Lambda: Check Images
+            VA->>K8s: Check Images
+            VA->>VA: Verify Signatures
+            
+            alt Violation Detected
+                VA->>Lambda: Disable Functions
+                VA->>K8s: Scale to 0
+                VA->>LS: Kill Switch Notification
+                LS->>LS: Alert Your Team
+            else All Valid
+                VA->>VA: Continue Monitoring
+            end
+        end
+    end
+```
+
+---
+
+## Diagram 11: Threat Response Matrix
+
+```mermaid
+flowchart TD
+    Start([Security Event Detected]) --> Type{Event Type}
+    
+    Type -->|Tampering| T1[Image Signature<br/>Verification Failed]
+    Type -->|Copying| T2[Unauthorized Image<br/>Detected]
+    Type -->|Extraction| T3[Network Policy<br/>Violation]
+    Type -->|Expiration| T4[License Expired]
+    Type -->|Replacement| T5[Image Digest<br/>Mismatch]
+    
+    T1 --> R1[Response:<br/>1. Kill Switch Activated<br/>2. All Containers Stopped<br/>3. Alert Your Team]
+    
+    T2 --> R2[Response:<br/>1. Image Won't Start<br/>2. License Validation Fails<br/>3. Log Attempt]
+    
+    T3 --> R3[Response:<br/>1. Network Blocked<br/>2. Can't Push to External<br/>3. Log Violation]
+    
+    T4 --> R4[Response:<br/>1. Kill Switch Activated<br/>2. Disable All Services<br/>3. Customer Notified]
+    
+    T5 --> R5[Response:<br/>1. Kill Switch Activated<br/>2. Potential Tampering Alert<br/>3. Emergency Shutdown]
+    
+    R1 --> Impact1[Impact:<br/>❌ Product Fully Stopped<br/>❌ Customer Cannot Use<br/>✅ Your IP Protected]
+    
+    R2 --> Impact2[Impact:<br/>❌ Copied Image Won't Run<br/>✅ License Prevents Use<br/>✅ Your IP Protected]
+    
+    R3 --> Impact3[Impact:<br/>❌ Cannot Extract Code<br/>✅ Network Isolated<br/>✅ Your IP Protected]
+    
+    R4 --> Impact4[Impact:<br/>❌ Product Fully Stopped<br/>⚠️ Renewal Required<br/>✅ Licensing Enforced]
+    
+    R5 --> Impact5[Impact:<br/>❌ Product Fully Stopped<br/>🚨 Critical Security Event<br/>✅ Tampering Prevented]
+    
+    Impact1 --> End[Customer Must Contact<br/>Your Support]
+    Impact2 --> End
+    Impact3 --> End
+    Impact4 --> End
+    Impact5 --> End
+    
+    style T1 fill:#ffcccc
+    style T2 fill:#ffcccc
+    style T3 fill:#ffcccc
+    style T4 fill:#ffffcc
+    style T5 fill:#ffcccc
+    style R1 fill:#ff6666,color:#fff
+    style R2 fill:#ff9966,color:#fff
+    style R3 fill:#ff9966,color:#fff
+    style R4 fill:#ffcc66
+    style R5 fill:#ff6666,color:#fff
+```
+
+---
+
+## Diagram 12: Data Flow - License Validation
+
+```mermaid
+graph TD
+    subgraph "Customer Environment"
+        A[Running Container] --> B[Validation Agent]
+        B --> C{Extract:<br/>- Image URI<br/>- Image Digest<br/>- Container ID}
+    end
+    
+    subgraph "Network Transit (HTTPS)"
+        C --> D[Validation Request]
+        D --> E{POST /api/v1/validate}
+        E --> F[Request Payload:<br/>- customer_id<br/>- product_id<br/>- license_key JWT<br/>- image_digest]
+    end
+    
+    subgraph "Your License Server"
+        F --> G[Receive Request]
+        G --> H{Verify Request<br/>Signature}
+        H -->|Invalid| I1[Return 401<br/>Unauthorized]
+        H -->|Valid| J{Decode JWT<br/>License Key}
+        
+        J -->|Invalid| I2[Return 403<br/>Invalid License]
+        J -->|Valid| K[Extract License Data:<br/>- customer_id<br/>- expiration<br/>- allowed_digests<br/>- features]
+        
+        K --> L{Check<br/>Customer ID}
+        L -->|Mismatch| I3[Return 403<br/>Wrong Customer]
+        L -->|Match| M{Check<br/>Expiration}
+        
+        M -->|Expired| I4[Return 403<br/>License Expired]
+        M -->|Valid| N{Check<br/>Image Digest}
+        
+        N -->|Not Allowed| I5[Return 403<br/>Unauthorized Image]
+        N -->|Allowed| O[Query Database]
+        
+        O --> P{Check<br/>Revocation}
+        P -->|Revoked| I6[Return 403<br/>License Revoked]
+        P -->|Active| Q[Log Request]
+        
+        Q --> R[Return 200 OK<br/>+ License Details]
+    end
+    
+    subgraph "Response Handling"
+        I1 --> Kill1[🚨 Kill Switch]
+        I2 --> Kill1
+        I3 --> Kill1
+        I4 --> Kill1
+        I5 --> Kill1
+        I6 --> Kill1
+        
+        R --> Success[✅ Validation Success]
+        
+        Kill1 --> S[Disable All<br/>Product Components]
+        Success --> T[Continue<br/>Operation]
+    end
+    
+    style H fill:#fff4e6
+    style J fill:#fff4e6
+    style L fill:#fff4e6
+    style M fill:#fff4e6
+    style N fill:#fff4e6
+    style P fill:#fff4e6
+    style Kill1 fill:#ff4444,color:#fff
+    style Success fill:#e6ffe6
+    style I1 fill:#ffcccc
+    style I2 fill:#ffcccc
+    style I3 fill:#ffcccc
+    style I4 fill:#ffcccc
+    style I5 fill:#ffcccc
+    style I6 fill:#ffcccc
+```
+
+---
+
+## Summary Legend
+
+### Color Coding
+- 🔵 **Blue** - Your Infrastructure & Control
+- 🔴 **Red** - Security/Protection Components
+- 🟡 **Yellow** - Customer Environment
+- 🟢 **Green** - Success/Valid State
+- ⚫ **Dark Red** - Kill Switch/Failure
+
+### Key Components
+- **Cosign** - Image signing and verification
+- **SBOM** - Software Bill of Materials
+- **in-toto** - Build attestations
+- **JWT** - License token format
+- **Init Container** - Pre-deployment validation
+- **Sidecar** - Continuous runtime monitoring
+- **Validation Agent** - Central monitoring daemon
+- **Kill Switch** - Emergency shutdown mechanism
+
+### Protection Guarantees
+1. ✅ **Anti-Tampering** - Signature verification prevents modification
+2. ✅ **IP Protection** - License binding prevents theft
+3. ✅ **Kill Switch** - Automatic shutdown on violations
+4. ✅ **Continuous Verification** - Runtime integrity checks
+5. ✅ **Network Isolation** - Prevents code extraction
+6. ✅ **Audit Trail** - Complete monitoring and logging
+7. ✅ **License Enforcement** - Time-bound product usage
+8. ✅ **Central Control** - Your license server controls all
+
