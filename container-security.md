@@ -6,7 +6,7 @@
 graph LR
     A[Dev Repo] --> B[Jenkins CI/CD]
     B --> C{Security Gates}
-    C -->|Scan| D[Trivy/Grype]
+    C -->|Scan| D[Twistlock]
     C -->|Sign| E[Cosign]
     C -->|SBOM| F[Syft]
     D --> G{Pass?}
