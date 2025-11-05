@@ -426,34 +426,5 @@ graph TB
     style E3 fill:#bbdefb
 ```
 
----
 
-## How to Use These Diagrams
-
-### Viewing Diagrams:
-1. **GitHub/GitLab**: These Mermaid diagrams render automatically
-2. **VS Code**: Install "Markdown Preview Mermaid Support" extension
-3. **Online**: Use [Mermaid Live Editor](https://mermaid.live/)
-4. **Documentation Tools**: Most modern tools support Mermaid (Confluence, Notion, etc.)
-
-### Exporting Diagrams:
-```bash
-# Install mermaid-cli
-npm install -g @mermaid-js/mermaid-cli
-
-# Export to PNG
-mmdc -i SECURITY-DIAGRAMS.md -o diagram1.png
-
-# Export to SVG
-mmdc -i SECURITY-DIAGRAMS.md -o diagram1.svg
-
-# Export to PDF
-mmdc -i SECURITY-DIAGRAMS.md -o diagram1.pdf
-```
-
-### Integration with Documentation:
-- Copy individual diagrams into presentation slides
-- Embed in Confluence pages
-- Include in architecture documents
-- Use in training materials
 
