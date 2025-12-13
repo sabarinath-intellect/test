@@ -1,989 +1,1049 @@
-# Engineering Technical Guide
-## Centralized ECR & Manifest-Driven Deployment Platform
+# Manifest File Preparation Job Guide
+## Complete Technical Reference for Manifest Generation & Management
 
-**Version:** 3.0  
+**Version:** 1.0  
 **Date:** December 13, 2025  
-**Audience:** Technical Architects, Engineering Teams, DevSecOps Engineers  
-**Maintained By:** Cloud Enablement & Governance Team  
+**Audience:** DevSecOps Engineers, Platform Engineers, Release Managers  
+**Owner:** Cloud Enablement & Governance Team  
 
 ---
 
 ## Table of Contents
 
-1. [Architecture Overview](#1-architecture-overview)
-2. [Core Components](#2-core-components)
-3. [Repository & Directory Structure](#3-repository--directory-structure)
-4. [Lambda Deployment Guide](#4-lambda-deployment-guide)
-5. [Kubernetes Deployment Guide](#5-kubernetes-deployment-guide)
-6. [Jenkins Pipeline Reference](#6-jenkins-pipeline-reference)
-7. [Cross-Account ECR Configuration](#7-cross-account-ecr-configuration)
-8. [Manifest System](#8-manifest-system)
-9. [Environment Promotion Workflow](#9-environment-promotion-workflow)
-10. [MAP Ticket Governance Process](#10-map-ticket-governance-process)
-11. [Service Onboarding Procedures](#11-service-onboarding-procedures)
-12. [Operational Runbooks](#12-operational-runbooks)
-13. [Troubleshooting Guide](#13-troubleshooting-guide)
-14. [Appendix: Code Templates](#14-appendix-code-templates)
+1. [Overview](#1-overview)
+2. [Manifest Preparation Flowcharts](#2-manifest-preparation-flowcharts)
+3. [Detailed Job Specifications](#3-detailed-job-specifications)
+4. [Sample Manifest Files](#4-sample-manifest-files)
+5. [Jenkins Pipeline Implementation](#5-jenkins-pipeline-implementation)
+6. [Storage & Distribution](#6-storage--distribution)
+7. [Validation & Verification](#7-validation--verification)
+8. [Troubleshooting](#8-troubleshooting)
 
 ---
 
-## 1. Architecture Overview
+## 1. Overview
 
-### 1.1 High-Level Architecture
+### 1.1 What is a Manifest File?
 
-The platform implements a **"Build Once, Deploy Everywhere"** model with decoupled CI/CD:
+A **Manifest File** is a version-specific JSON document that serves as the **single source of truth** for deploying the Purple Fabric platform. It contains:
+
+- All service image URIs from Centralized ECR
+- Version tags for each service
+- Configuration references
+- Dependency mappings
+
+**Key Principle:** *By providing this manifest file, we must be able to deploy/recreate the entire environment, provided the infrastructure configuration remains the same.*
+
+### 1.2 Why Manifest Files?
+
+| Problem | Solution with Manifest |
+|---------|------------------------|
+| Multiple microservices with various image versions | Single file lists all qualified images |
+| Difficulty identifying stable/qualified images | Manifest acts as "qualified" seal of approval |
+| Hardcoded configurations in deployments | Manifest + Parameter Store = dynamic injection |
+| Environment recreation complexity | Deploy entire environment from one manifest |
+
+### 1.3 Manifest File Naming Convention
+
+```
+{type}-manifest-{version}.json
+```
+
+**Examples:**
+- `lambda-manifest-25.3.0.0.json`
+- `k8s-manifest-25.3.0.0.json`
+- `full-manifest-25.3.0.0.json`
+
+---
+
+## 2. Manifest Preparation Flowcharts
+
+### 2.1 Overall Manifest Lifecycle
 
 ```mermaid
-graph TB
-    subgraph "Central Management Layer"
-        ECR[Centralized ECR<br/>Single Source of Truth]
-        IAC[IAC Repository<br/>idxp_map_infra_iac_svc]
-        PS[Parameter Store<br/>/PF/{env}/*]
-        S3[Artifact Storage<br/>Helm Charts & Manifests]
+flowchart TB
+    subgraph "Development Phase"
+        A[Dev Pipeline Builds Images] --> B[Push to Centralized ECR]
+        B --> C[Tag: dev-branch-buildnum]
     end
     
-    subgraph "Development Environment"
-        DEV[Dev Account]
-        BUILD[Jenkins CI Pipeline]
-        DEVK8S[Dev EKS Cluster]
-        DEVLAMBDA[Dev Lambda Functions]
+    subgraph "QA Promotion Phase"
+        D[Trigger: Promote to QA Job] --> E[Collect Dev Image Information]
+        E --> F[Generate QA Manifest File]
+        F --> G[Validate All Images Exist]
+        G --> H{Validation Pass?}
+        H -->|No| I[Fail - Report Missing Images]
+        H -->|Yes| J[Retag Images: dev → qa-version]
+        J --> K[Store Manifest]
     end
     
-    subgraph "Target Environments"
-        QA[QA Account]
-        STG[Staging Account]
-        PROD[Production Account]
-        CUST[Customer Accounts]
-        AUTO[iaiautomation Account]
+    subgraph "Storage Destinations"
+        K --> L[IAC Repo - QA Branch]
+        K --> M[Parameter Store: /PF/lambda/version]
     end
     
-    BUILD -->|Push Images| ECR
-    BUILD -->|Push Charts| S3
-    IAC -->|Sync Configs| PS
+    subgraph "Deployment Phase"
+        N[QA Deployment Job] --> O[Fetch Manifest from Parameter Store]
+        O --> P[Deploy Each Service Using Manifest]
+    end
     
-    ECR -->|Pull Images| QA
-    ECR -->|Pull Images| STG
-    ECR -->|Pull Images| PROD
-    ECR -->|Pull Images| CUST
-    ECR -->|Pull Images| AUTO
+    C --> D
+    L --> N
+    M --> N
 ```
 
-### 1.2 Core Architecture Principles
+### 2.2 Manifest Preparation Job Flow (Detailed)
 
-| Principle | Implementation | Benefit |
-|-----------|----------------|---------|
-| **Build Once** | Docker images built only in Dev pipeline | Eliminates environment drift |
-| **Centralized ECR** | Single ECR repository for all images | Single source of truth |
-| **Manifest-Driven** | JSON manifests define deployments | Version-controlled deployments |
-| **Cross-Account Access** | IAM resource policies | Secure multi-account access |
-| **Configuration Injection** | Parameter Store at runtime | Environment-agnostic images |
+```mermaid
+flowchart TD
+    START([Start: Manifest Preparation Job]) --> INPUT[/Input Parameters:<br/>VERSION: 25.3.0.0<br/>TARGET_ENV: qa<br/>SERVICE_LIST: all or specific/]
+    
+    INPUT --> FETCH_SERVICES[Fetch List of All Services<br/>from IAC Repository]
+    
+    FETCH_SERVICES --> LOOP_START{For Each Service}
+    
+    LOOP_START --> CHECK_DEV_IMAGE[Check Dev Image Exists<br/>in Centralized ECR]
+    
+    CHECK_DEV_IMAGE --> DEV_EXISTS{Image Found?}
+    
+    DEV_EXISTS -->|No| LOG_MISSING[Log Missing Image<br/>Add to Error List]
+    DEV_EXISTS -->|Yes| GET_DIGEST[Get Image Digest/SHA]
+    
+    LOG_MISSING --> NEXT_SERVICE
+    GET_DIGEST --> GET_TEMPLATE[Verify template.yaml Exists<br/>in IAC Repo]
+    
+    GET_TEMPLATE --> TEMPLATE_EXISTS{Template Found?}
+    
+    TEMPLATE_EXISTS -->|No| LOG_TEMPLATE_MISSING[Log Missing Template<br/>Add to Error List]
+    TEMPLATE_EXISTS -->|Yes| ADD_TO_MANIFEST[Add Service Entry<br/>to Manifest Object]
+    
+    LOG_TEMPLATE_MISSING --> NEXT_SERVICE
+    ADD_TO_MANIFEST --> NEXT_SERVICE{More Services?}
+    
+    NEXT_SERVICE -->|Yes| LOOP_START
+    NEXT_SERVICE -->|No| CHECK_ERRORS{Any Errors?}
+    
+    CHECK_ERRORS -->|Yes| FAIL_JOB[❌ Fail Job<br/>Display Error Report]
+    CHECK_ERRORS -->|No| GENERATE_JSON[Generate Manifest JSON File]
+    
+    GENERATE_JSON --> VALIDATE_JSON[Validate JSON Schema]
+    VALIDATE_JSON --> RETAG_IMAGES[Retag All Images<br/>dev-tag → env-version]
+    
+    RETAG_IMAGES --> STORE_IAC[Store in IAC Repo<br/>manifests/VERSION/]
+    STORE_IAC --> STORE_SSM[Store in Parameter Store<br/>/PF/lambda/VERSION]
+    
+    STORE_SSM --> NOTIFY[Send Notification<br/>Slack/Email]
+    NOTIFY --> SUCCESS([✅ Job Complete])
+    
+    FAIL_JOB --> END_FAIL([❌ Job Failed])
+```
 
-### 1.3 Technology Stack
+### 2.3 QA Sign-Off & Staging Manifest Flow
 
-| Component | Technology | Purpose |
-|-----------|------------|---------|
-| **Container Registry** | Amazon ECR | Centralized image storage |
-| **CI/CD** | Jenkins | Build and deployment orchestration |
-| **Lambda Deployment** | AWS SAM + CloudFormation | Serverless function deployment |
-| **K8s Deployment** | Helm 3 | Kubernetes package management |
-| **Configuration** | AWS SSM Parameter Store | Environment-specific configs |
-| **Artifacts** | Amazon S3 / CodeArtifact | Helm chart storage |
-| **Secrets** | HashiCorp Vault | Secret management |
-| **Build** | AWS CodeBuild | Docker image builds |
+```mermaid
+flowchart TD
+    A[QA Team Triggers Sign-Off Job] --> B[Fetch QA Manifest<br/>/PF/lambda/25.3.0.0]
+    
+    B --> C[Run Automated QA Tests]
+    C --> D{All Tests Pass?}
+    
+    D -->|No| E[Generate Failure Report]
+    E --> F[Notify QA Team]
+    F --> G([Sign-Off Failed])
+    
+    D -->|Yes| H[Mark Images as Qualified]
+    H --> I[Retag Images: qa → stg]
+    
+    I --> J[Generate Staging Manifest]
+    J --> K[Store in IAC Repo Master Branch]
+    K --> L[Store in Parameter Store<br/>/PF/lambda/25.3.0.0-stg]
+    
+    L --> M[Deploy to iaiautomation Account]
+    M --> N[Run Automation Tests]
+    
+    N --> O{Automation Tests Pass?}
+    O -->|No| P[Rollback & Report]
+    O -->|Yes| Q[Publish QA Dashboard Report]
+    
+    Q --> R[Ready for Staging Deployment]
+    R --> S([✅ Sign-Off Complete])
+```
+
+### 2.4 Environment-Specific Manifest Flow
+
+```mermaid
+flowchart LR
+    subgraph "Dev Environment"
+        DEV_BUILD[Build Image] --> DEV_TAG[Tag: dev-feature-123]
+    end
+    
+    subgraph "QA Promotion"
+        DEV_TAG --> QA_MANIFEST[Generate QA Manifest]
+        QA_MANIFEST --> QA_TAG[Retag: qa-25.3.0.0]
+    end
+    
+    subgraph "QA Sign-Off"
+        QA_TAG --> QA_TEST[QA Testing]
+        QA_TEST --> STG_MANIFEST[Generate Staging Manifest]
+        STG_MANIFEST --> STG_TAG[Retag: stg-25.3.0.0]
+    end
+    
+    subgraph "Production"
+        STG_TAG --> PROD_MANIFEST[Generate Prod Manifest]
+        PROD_MANIFEST --> PROD_TAG[Retag: prod-25.3.0.0]
+    end
+```
 
 ---
 
-## 2. Core Components
+## 3. Detailed Job Specifications
 
-### 2.1 Centralized ECR
+### 3.1 Job: `manifest-preparation-job`
 
-**Account:** Central AWS Account  
-**Region:** us-east-1 (primary)
+**Purpose:** Generate manifest file for environment promotion
 
-#### Repository Naming Convention
-```
-{account-id}.dkr.ecr.{region}.amazonaws.com/{service-name}
-```
+**Trigger:** Manual (Product Owner / Release Manager)
 
-#### Tagging Strategy
-| Environment | Tag Format | Example |
-|-------------|------------|---------|
-| Development | `dev-{branch}-{build}` | `dev-feature-123-456` |
-| QA | `qa-{version}` | `qa-25.3.0.0` |
-| Staging | `stg-{version}` | `stg-25.3.0.0` |
-| Production | `prod-{version}` | `prod-25.3.0.0` |
+#### Input Parameters
 
-#### ECR Resource Policy (Cross-Account Access)
+| Parameter | Type | Required | Description | Example |
+|-----------|------|----------|-------------|---------|
+| `VERSION` | String | Yes | Release version | `25.3.0.0` |
+| `TARGET_ENV` | Choice | Yes | Target environment | `qa`, `stg`, `prod` |
+| `SERVICE_LIST` | String | No | Comma-separated services or "all" | `all` or `chunk-asset,embedding-gen-asset` |
+| `SOURCE_ENV` | String | No | Source environment for images | `dev` (default) |
+| `DRY_RUN` | Boolean | No | Validate only, don't store | `false` |
+
+#### Job Steps
+
+| Step | Description | Actions |
+|------|-------------|---------|
+| 1 | **Initialize** | Clone IAC repo, set up AWS credentials |
+| 2 | **Discover Services** | List all services from IAC repo structure |
+| 3 | **Validate Images** | Check each service image exists in ECR |
+| 4 | **Validate Templates** | Verify template.yaml exists for each service |
+| 5 | **Generate Manifest** | Create JSON manifest with all service URIs |
+| 6 | **Retag Images** | Copy ECR tags from source to target env |
+| 7 | **Store Manifest** | Push to IAC repo and Parameter Store |
+| 8 | **Notify** | Send success/failure notification |
+
+#### Output
+
+- Manifest JSON file stored in IAC repo
+- Manifest stored in AWS Parameter Store
+- Slack/Email notification with summary
+
+---
+
+### 3.2 Job: `qa-signoff-job`
+
+**Purpose:** Qualify images after QA testing and prepare for staging
+
+**Trigger:** QA Team after testing completion
+
+#### Input Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `VERSION` | String | Yes | Version to sign off |
+| `QA_REPORT_LINK` | String | No | Link to QA test report |
+| `SKIP_AUTOMATION` | Boolean | No | Skip iaiautomation deployment |
+
+#### Job Steps
+
+| Step | Description |
+|------|-------------|
+| 1 | Fetch QA manifest from Parameter Store |
+| 2 | Validate all services are deployed in QA |
+| 3 | Run automated regression tests |
+| 4 | Generate staging manifest |
+| 5 | Retag images: `qa-version` → `stg-version` |
+| 6 | Store staging manifest in IAC repo (master branch) |
+| 7 | Deploy to iaiautomation account |
+| 8 | Run automation tests |
+| 9 | Publish QA dashboard report |
+
+---
+
+### 3.3 Job: `manifest-deployment-job`
+
+**Purpose:** Deploy services using manifest file
+
+**Trigger:** After manifest is prepared
+
+#### Input Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `VERSION` | String | Yes | Manifest version to deploy |
+| `ENVIRONMENT` | Choice | Yes | Target environment |
+| `SERVICE_NAME` | String | No | Specific service or "all" |
+
+#### Job Steps
+
+| Step | Description |
+|------|-------------|
+| 1 | Fetch manifest from Parameter Store |
+| 2 | Validate manifest matches IAC repo |
+| 3 | Pre-deployment checks (images, templates) |
+| 4 | Deploy each service using SAM/Helm |
+| 5 | Post-deployment health checks |
+| 6 | Update deployment status |
+
+---
+
+## 4. Sample Manifest Files
+
+### 4.1 Lambda Manifest (Full Example)
+
+**File:** `lambda-manifest-25.3.0.0.json`
+
 ```json
 {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "AllowCrossAccountPull",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": [
-          "arn:aws:iam::QA-ACCOUNT-ID:role/LambdaExecutionRole",
-          "arn:aws:iam::QA-ACCOUNT-ID:role/EKSNodeRole",
-          "arn:aws:iam::PROD-ACCOUNT-ID:role/LambdaExecutionRole",
-          "arn:aws:iam::CUSTOMER-ACCOUNT-ID:role/LambdaExecutionRole"
-        ]
-      },
-      "Action": [
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchGetImage",
-        "ecr:BatchCheckLayerAvailability"
+  "manifest_version": "1.0",
+  "release_version": "25.3.0.0",
+  "environment": "qa",
+  "created_at": "2025-12-13T10:30:00Z",
+  "created_by": "jenkins-manifest-job",
+  "build_number": "456",
+  
+  "ecr_registry": "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+  
+  "services": {
+    "chunk-asset": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/chunk-asset:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "image_digest": "sha256:abc123def456789...",
+      "source_tag": "dev-develop-456",
+      "template_path": "services/chunk-asset/lambda/chunk-asset/lambda/template.yaml",
+      "config_version": "25.3.0.0",
+      "memory_size": 1024,
+      "timeout": 900,
+      "dependencies": ["chunk-init-asset"],
+      "sqs_queues": [
+        "qa_map_chunk_1_queue.fifo",
+        "qa_map_chunk_2_queue.fifo",
+        "qa_map_chunk_3_queue.fifo",
+        "qa_map_chunk_4_queue.fifo",
+        "qa_map_chunk_5_queue.fifo",
+        "qa_map_chunk_queue.fifo"
+      ]
+    },
+    
+    "chunk-init-asset": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/chunk-init-asset:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "image_digest": "sha256:def789ghi012345...",
+      "source_tag": "dev-develop-455",
+      "template_path": "services/chunk-init-asset/lambda/chunk-init-asset/lambda/template.yaml",
+      "config_version": "25.3.0.0",
+      "memory_size": 512,
+      "timeout": 300,
+      "dependencies": [],
+      "sqs_queues": [
+        "qa_map_chunk_automation_queue.fifo",
+        "qa_map_kb_doc_import_queue.fifo"
+      ]
+    },
+    
+    "embedding-gen-asset": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/embedding-gen-asset:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "image_digest": "sha256:ghi456jkl789012...",
+      "source_tag": "dev-develop-457",
+      "template_path": "services/embedding-gen-asset/lambda/embedding-gen-asset/lambda/template.yaml",
+      "config_version": "25.3.0.0",
+      "memory_size": 2048,
+      "timeout": 900,
+      "dependencies": ["embedding-init-asset"],
+      "sqs_queues": [
+        "qa_map_embedding_1_queue.fifo",
+        "qa_map_embedding_2_queue.fifo",
+        "qa_map_embedding_3_queue.fifo",
+        "qa_map_embedding_4_queue.fifo",
+        "qa_map_embedding_5_queue.fifo"
+      ]
+    },
+    
+    "embedding-init-asset": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/embedding-init-asset:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "image_digest": "sha256:jkl012mno345678...",
+      "source_tag": "dev-develop-454",
+      "template_path": "services/embedding-init-asset/lambda/embedding-init-asset/lambda/template.yaml",
+      "config_version": "25.3.0.0",
+      "memory_size": 512,
+      "timeout": 300,
+      "dependencies": [],
+      "sqs_queues": [
+        "qa_map_embedding_init_lambda_queue.fifo"
+      ]
+    },
+    
+    "file-text-extraction": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/file-text-extraction:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "image_digest": "sha256:mno678pqr901234...",
+      "source_tag": "dev-develop-458",
+      "template_path": "services/file-text-extraction/lambda/file-text-extraction/lambda/template.yaml",
+      "config_version": "25.3.0.0",
+      "memory_size": 1024,
+      "timeout": 600,
+      "dependencies": [],
+      "sqs_queues": [
+        "qa_map_textextraction_asset_queue.fifo",
+        "qa_map_textract_v2_queue.fifo"
+      ]
+    },
+    
+    "file-img-conversion": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/file-img-conversion:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "image_digest": "sha256:pqr234stu567890...",
+      "source_tag": "dev-develop-459",
+      "template_path": "services/file-img-conversion/lambda/file-img-conversion/lambda/template.yaml",
+      "config_version": "25.3.0.0",
+      "memory_size": 1024,
+      "timeout": 600,
+      "dependencies": [],
+      "sqs_queues": [
+        "qa_map_file2image_asset_queue.fifo",
+        "qa_map_file_image_conversion_automation_queue.fifo"
+      ]
+    },
+    
+    "asset-dlq-listener": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/asset-dlq-listener:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "image_digest": "sha256:stu890vwx123456...",
+      "source_tag": "dev-develop-460",
+      "template_path": "services/asset-dlq-listener/lambda/asset-dlq-listener/lambda/template.yaml",
+      "config_version": "25.3.0.0",
+      "memory_size": 512,
+      "timeout": 300,
+      "dependencies": [],
+      "sqs_queues": [
+        "qa_map_chunk_automation_queue_dlq.fifo",
+        "qa_map_chunk_queue_dlq.fifo",
+        "qa_map_embedding_automation_queue_dlq.fifo",
+        "qa_map_embedding_queue_dlq.fifo"
+      ]
+    },
+    
+    "gen-ai-tools": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/gen-ai-tools:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "image_digest": "sha256:vwx456yza789012...",
+      "source_tag": "dev-develop-461",
+      "template_path": "services/gen-ai-tools/lambda/gen-ai-tools/lambda/template.yaml",
+      "config_version": "25.3.0.0",
+      "memory_size": 2048,
+      "timeout": 900,
+      "dependencies": [],
+      "sqs_queues": []
+    },
+    
+    "web-scraper-static": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/web-scraper-static:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "image_digest": "sha256:yza012bcd345678...",
+      "source_tag": "dev-develop-462",
+      "template_path": "services/web-scraper/lambda/web-scraper-static/lambda/template.yaml",
+      "config_version": "25.3.0.0",
+      "memory_size": 1024,
+      "timeout": 600,
+      "dependencies": [],
+      "sqs_queues": [
+        "qa-scrap-request-queue",
+        "qa-site-data-request-queue"
+      ]
+    },
+    
+    "web-scraper-dynamic": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/web-scraper-dynamic:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "image_digest": "sha256:bcd678efg901234...",
+      "source_tag": "dev-develop-463",
+      "template_path": "services/web-scraper/lambda/web-scraper-dynamic/lambda/template.yaml",
+      "config_version": "25.3.0.0",
+      "memory_size": 2048,
+      "timeout": 900,
+      "dependencies": [],
+      "sqs_queues": [
+        "qa-site-data-request-queue"
       ]
     }
-  ]
+  },
+  
+  "infrastructure": {
+    "iac_repo": "idxp_map_infra_iac_svc",
+    "iac_branch": "qa",
+    "iac_commit": "a1b2c3d4e5f6",
+    "parameter_store_path": "/PF/qa/",
+    "s3_artifacts_path": "s3://pf-artifacts/lambda/25.3.0.0/"
+  },
+  
+  "metadata": {
+    "total_services": 10,
+    "source_environment": "dev",
+    "promotion_type": "scheduled",
+    "approver": "product-manager@company.com",
+    "jira_ticket": "MAP-1234"
+  }
 }
 ```
 
-### 2.2 IAC Repository Structure
+### 4.2 K8s Manifest (Full Example)
 
-**Repository:** `idxp_map_infra_iac_svc` (iGit)
+**File:** `k8s-manifest-25.3.0.0.json`
 
-```
-idxp_map_infra_iac_svc/
-├── services/
-│   ├── chunk-asset/
-│   │   ├── chunk-asset/              # Helm chart directory
-│   │   │   ├── Chart.yaml
-│   │   │   ├── values.yaml
-│   │   │   └── templates/
-│   │   │       ├── deployment.yaml
-│   │   │       ├── service.yaml
-│   │   │       ├── ingress.yaml
-│   │   │       ├── configmap.yaml
-│   │   │       ├── keda-scaledobject.yaml
-│   │   │       └── _helpers.tpl
-│   │   ├── lambda/
-│   │   │   └── chunk-asset/
-│   │   │       └── lambda/
-│   │   │           ├── template.yaml       # SAM/CFN template
-│   │   │           └── template_v1.yaml    # Customer version
-│   │   ├── jenkins/
-│   │   │   └── Jenkinsfile
-│   │   └── qa-chunk-asset.yaml             # QA overrides
-│   │
-│   ├── chunk-init-asset/
-│   ├── embedding-gen-asset/
-│   ├── embedding-init-asset/
-│   ├── file-text-extraction/
-│   ├── file-img-conversion/
-│   ├── asset-dlq-listener/
-│   ├── gen-ai-tools/
-│   ├── data-service/
-│   ├── datacollection/
-│   ├── web-scraper-static/
-│   └── web-scraper-dynamic/
-│
-├── shared/
-│   ├── networking/
-│   ├── security/
-│   └── monitoring/
-│
-├── environments/
-│   ├── dev/
-│   ├── qa/
-│   ├── staging/
-│   └── production/
-│
-├── manifests/
-│   ├── 25.3.0.0/
-│   │   ├── lambda-manifest.json
-│   │   └── k8s-manifest.json
-│   └── 25.2.0.0/
-│
-└── README.md
-```
-
-### 2.3 Parameter Store Structure
-
-```
-/PF/
-├── dev/
-│   ├── vpc/
-│   │   ├── vpc-id
-│   │   ├── private-subnet-1
-│   │   └── private-subnet-2
-│   ├── database/
-│   │   ├── host
-│   │   ├── username
-│   │   └── password (SecureString)
-│   ├── redis/
-│   │   └── endpoint
-│   ├── s3/
-│   │   └── chunk-bucket
-│   └── logging/
-│       └── level
-├── qa/
-├── stg/
-├── prod/
-└── lambda/
-    └── 25.3.0.0/                    # Version-specific manifest
-        └── manifest.json
-```
-
----
-
-## 3. Repository & Directory Structure
-
-### 3.1 Service Repository (Application Code)
-
-Each microservice has its own repository containing only application code:
-
-```
-chunk-asset-service/
-├── src/
-│   ├── main.py
-│   ├── processor.py
-│   └── utils/
-├── tests/
-├── requirements.txt
-├── Dockerfile
-└── README.md
-```
-
-### 3.2 Lambda Source Package Structure
-
-For SAM-based Lambda deployments:
-
-```
-source.zip
-├── buildspec-chunk-asset.yml
-├── chunk-asset/
-│   ├── app_code/
-│   ├── idxp_config/
-│   ├── lambda/
-│   │   └── template.yaml
-│   ├── LambdaDockerfile
-│   └── resources/
-├── deploy-chunk-asset.sh
-└── pre-req-chunk-asset.sh
-```
-
----
-
-## 4. Lambda Deployment Guide
-
-### 4.1 SAM-Based Lambda Deployment Flow
-
-```mermaid
-sequenceDiagram
-    participant Dev as Developer
-    participant S3 as SAM Source S3
-    participant Jenkins as Jenkins
-    participant CB as CodeBuild
-    participant PS as Parameter Store
-    participant ECR as Centralized ECR
-    participant CF as CloudFormation
-    participant Lambda as Lambda Function
+```json
+{
+  "manifest_version": "1.0",
+  "release_version": "25.3.0.0",
+  "environment": "qa",
+  "created_at": "2025-12-13T10:30:00Z",
+  "created_by": "jenkins-manifest-job",
+  
+  "docker_registry": "dockerhub.company.com",
+  
+  "services": {
+    "idxp-map-api-gateway": {
+      "image_uri": "dockerhub.company.com/idxp-map-api-gateway:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "helm_chart_path": "services/idxp-map-api-gateway/idxp-map-api-gateway/",
+      "helm_chart_version": "1.0.0",
+      "replicas": 2,
+      "resources": {
+        "limits": {"cpu": "500m", "memory": "512Mi"},
+        "requests": {"cpu": "250m", "memory": "256Mi"}
+      }
+    },
     
-    Dev->>S3: Upload source.zip
-    Dev->>Jenkins: Trigger deployment
-    Jenkins->>S3: Sync source code
-    Jenkins->>CB: Start CodeBuild
-    
-    Note over CB: Build Phase
-    CB->>S3: Download source
-    CB->>CB: Execute buildspec.yml
-    CB->>CB: Run pre-req.sh
-    CB->>PS: Fetch parameters
-    CB->>CB: Build Docker image
-    CB->>ECR: Push image
-    
-    Note over CB: Deploy Phase
-    CB->>CB: Run deploy.sh
-    CB->>CB: sam build
-    CB->>CB: sam package
-    CB->>CF: sam deploy
-    CF->>Lambda: Create/Update function
-    Lambda->>ECR: Pull image
-```
-
-### 4.2 Key Deployment Scripts
-
-#### buildspec.yml
-```yaml
-version: 0.2
-
-env:
-  variables:
-    FUNCTION_NAME: "chunk-asset"
-    ENVIRONMENT: "dev"
-    REGION: "us-east-1"
-
-phases:
-  install:
-    runtime-versions:
-      python: 3.9
-      docker: 20
-    commands:
-      - pip install aws-sam-cli
-
-  pre_build:
-    commands:
-      - echo "Running pre-requisites..."
-      - chmod +x pre-req-${FUNCTION_NAME}.sh
-      - ./pre-req-${FUNCTION_NAME}.sh ${FUNCTION_NAME} ${ENVIRONMENT} ${REGION}
-      
-  build:
-    commands:
-      - echo "Building Docker image..."
-      - chmod +x deploy-${FUNCTION_NAME}.sh
-      - ./deploy-${FUNCTION_NAME}.sh ${FUNCTION_NAME} ${ENVIRONMENT} ${REGION}
-
-  post_build:
-    commands:
-      - echo "Deployment completed"
-
-artifacts:
-  files:
-    - '**/*'
-```
-
-#### deploy.sh (Key Functions)
-```bash
-#!/bin/bash
-
-# Input validation
-FUNCTION_NAME=$1
-ENVIRONMENT=$2
-REGION=$3
-BUILD_NUMBER=${CODEBUILD_BUILD_NUMBER:-1}
-
-# Set AWS region
-export AWS_DEFAULT_REGION=$REGION
-
-# Navigate to Lambda directory
-cd ${FUNCTION_NAME}
-
-# Fetch parameters from SSM
-get_parameter() {
-    aws ssm get-parameter --name "$1" --with-decryption --query 'Parameter.Value' --output text
+    "idxp-map-core-service": {
+      "image_uri": "dockerhub.company.com/idxp-map-core-service:qa-25.3.0.0",
+      "image_tag": "qa-25.3.0.0",
+      "helm_chart_path": "services/idxp-map-core-service/idxp-map-core-service/",
+      "helm_chart_version": "1.0.0",
+      "replicas": 3,
+      "resources": {
+        "limits": {"cpu": "1000m", "memory": "1024Mi"},
+        "requests": {"cpu": "500m", "memory": "512Mi"}
+      }
+    }
+  },
+  
+  "infrastructure": {
+    "iac_repo": "idxp_map_infra_iac_svc",
+    "iac_branch": "qa",
+    "helm_repo_url": "s3://pf-artifacts/helm-charts/25.3.0.0/",
+    "eks_cluster": "pf-qa-cluster",
+    "namespace": "purple-fabric"
+  }
 }
-
-VPC_SG=$(get_parameter "/PF/${ENVIRONMENT}/vpc/security-group")
-VPC_SUBNETS=$(get_parameter "/PF/${ENVIRONMENT}/vpc/subnets")
-FS_ARN=$(get_parameter "/PF/${ENVIRONMENT}/efs/arn")
-CHUNK_QUEUE=$(get_parameter "/PF/${ENVIRONMENT}/sqs/chunk-queue")
-
-# ECR Setup
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-ECR_REPO="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${FUNCTION_NAME}"
-IMAGE_TAG="${ENVIRONMENT}-${BUILD_NUMBER}"
-
-# Docker login to ECR
-aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_REPO}
-
-# Create ECR repo if not exists
-aws ecr describe-repositories --repository-names ${FUNCTION_NAME} || \
-    aws ecr create-repository --repository-name ${FUNCTION_NAME}
-
-# Build Docker image
-docker build -t ${FUNCTION_NAME}:${IMAGE_TAG} -f LambdaDockerfile .
-docker tag ${FUNCTION_NAME}:${IMAGE_TAG} ${ECR_REPO}:${IMAGE_TAG}
-docker push ${ECR_REPO}:${IMAGE_TAG}
-
-# SAM Deploy
-cd lambda
-sam build --template-file template.yaml
-sam package --output-template-file packaged.yaml --s3-bucket ${SAM_BUCKET}
-
-sam deploy \
-    --template-file packaged.yaml \
-    --stack-name ${FUNCTION_NAME}-${ENVIRONMENT} \
-    --parameter-overrides \
-        ImageUri=${ECR_REPO}:${IMAGE_TAG} \
-        EnvironmentType=${ENVIRONMENT} \
-        VPCSG=${VPC_SG} \
-        VPCSubnetIDS=${VPC_SUBNETS} \
-        FSArn=${FS_ARN} \
-        ChunkQueue=${CHUNK_QUEUE} \
-    --capabilities CAPABILITY_IAM \
-    --no-fail-on-empty-changeset
 ```
 
-### 4.3 Lambda CloudFormation Template
+### 4.3 Minimal Manifest (Quick Reference)
 
-```yaml
-AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
-Description: 'Chunk Asset Lambda Function'
-
-Parameters:
-  ImageUri:
-    Type: String
-    Description: 'ECR Image URI'
-  
-  EnvironmentType:
-    Type: String
-    AllowedValues: [dev, qa, staging, prod]
-  
-  VPCSG:
-    Type: String
-    Description: 'VPC Security Group ID'
-  
-  VPCSubnetIDS:
-    Type: CommaDelimitedList
-    Description: 'VPC Subnet IDs'
-  
-  FSArn:
-    Type: String
-    Description: 'EFS File System ARN'
-  
-  FSMountPath:
-    Type: String
-    Default: '/mnt/MagicPlatform'
-  
-  ChunkQueue:
-    Type: String
-    Description: 'SQS Queue ARN for chunk processing'
-
-Globals:
-  Function:
-    Timeout: 900
-    MemorySize: 1024
-
-Resources:
-  ChunkAssetFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub 'chunk-asset-${EnvironmentType}'
-      PackageType: Image
-      ImageUri: !Ref ImageUri
-      Role: !GetAtt ExecutionRole.Arn
-      
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref VPCSG
-        SubnetIds: !Ref VPCSubnetIDS
-      
-      FileSystemConfigs:
-        - Arn: !Ref FSArn
-          LocalMountPath: !Ref FSMountPath
-      
-      Environment:
-        Variables:
-          ENVIRONMENT: !Ref EnvironmentType
-          LOG_LEVEL: 'DEBUG'
-      
-      Events:
-        SQSEvent:
-          Type: SQS
-          Properties:
-            Queue: !Ref ChunkQueue
-            BatchSize: 1
-      
-      Tags:
-        Environment: !Ref EnvironmentType
-        Service: 'chunk-asset'
-        ManagedBy: 'SAM'
-
-  ExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'chunk-asset-${EnvironmentType}-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
-      
-      Policies:
-        - PolicyName: LambdaPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - ssm:GetParameter
-                  - ssm:GetParameters
-                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/PF/${EnvironmentType}/*'
-              
-              - Effect: Allow
-                Action:
-                  - sqs:ReceiveMessage
-                  - sqs:DeleteMessage
-                  - sqs:GetQueueAttributes
-                Resource: !Ref ChunkQueue
-              
-              - Effect: Allow
-                Action:
-                  - elasticfilesystem:ClientMount
-                  - elasticfilesystem:ClientWrite
-                Resource: !Ref FSArn
-
-Outputs:
-  FunctionArn:
-    Value: !GetAtt ChunkAssetFunction.Arn
-    Export:
-      Name: !Sub 'chunk-asset-${EnvironmentType}-arn'
-```
-
-### 4.4 Lambda Services & SQS Mappings
-
-| Lambda Name | SQS Queues |
-|-------------|------------|
-| **chunk-asset** | `{env}_map_chunk_1_queue.fifo` through `{env}_map_chunk_5_queue.fifo`, `{env}_map_chunk_queue.fifo` |
-| **chunk-init-asset** | `{env}_map_chunk_automation_queue.fifo`, `{env}_map_kb_doc_import_queue.fifo` |
-| **embedding-gen-asset** | `{env}_map_embedding_1_queue.fifo` through `{env}_map_embedding_5_queue.fifo` |
-| **embedding-init-asset** | `{env}_map_embedding_init_lambda_queue.fifo` |
-| **file-text-extraction** | `{env}_map_textextraction_asset_queue.fifo`, `{env}_map_textract_v2_queue.fifo` |
-| **file-img-conversion** | `{env}_map_file2image_asset_queue.fifo`, `{env}_map_file_image_conversion_automation_queue.fifo` |
-| **asset-dlq-listener** | Multiple DLQ queues for error handling |
-| **gen-ai-tools** | No SQS trigger |
-
----
-
-## 5. Kubernetes Deployment Guide
-
-### 5.1 Helm-Based Deployment Flow
-
-```mermaid
-sequenceDiagram
-    participant Dev as Developer
-    participant Jenkins as Jenkins Pipeline
-    participant IAC as IAC Repository
-    participant DockerHub as Docker Hub
-    participant S3 as S3/CodeArtifact
-    participant EKS as EKS Cluster
-    
-    Dev->>Jenkins: Trigger K8s deployment
-    Jenkins->>IAC: Fetch Jenkinsfile
-    Jenkins->>IAC: Fetch Helm charts
-    Jenkins->>Jenkins: Build Docker image
-    Jenkins->>DockerHub: Push image
-    
-    Jenkins->>Jenkins: helm package
-    Jenkins->>S3: Store chart.tgz
-    
-    Jenkins->>EKS: helm upgrade --install
-    EKS->>DockerHub: Pull image
-    EKS->>EKS: Deploy pods
-```
-
-### 5.2 Helm Chart Structure
-
-#### Chart.yaml
-```yaml
-apiVersion: v2
-name: chunk-asset
-description: Chunk Asset Processing Service
-type: application
-version: 1.0.0
-appVersion: "25.3.0.0"
-```
-
-#### values.yaml
-```yaml
-replicaCount: 2
-
-image:
-  repository: ""  # Injected from manifest
-  tag: ""         # Injected from manifest
-  pullPolicy: IfNotPresent
-
-service:
-  type: ClusterIP
-  port: 80
-  targetPort: 8080
-
-ingress:
-  enabled: true
-  className: nginx
-  annotations:
-    kubernetes.io/ingress.class: nginx
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
-  hosts:
-    - host: chunk-asset.example.com
-      paths:
-        - path: /
-          pathType: Prefix
-
-resources:
-  limits:
-    cpu: 500m
-    memory: 512Mi
-  requests:
-    cpu: 250m
-    memory: 256Mi
-
-autoscaling:
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 10
-  targetCPUUtilizationPercentage: 80
-
-configMap:
-  enabled: true
-  data:
-    ENVIRONMENT: "dev"
-    LOG_LEVEL: "INFO"
-
-secrets:
-  enabled: false
-
-keda:
-  enabled: true
-  pollingInterval: 30
-  cooldownPeriod: 300
-  minReplicaCount: 1
-  maxReplicaCount: 10
-```
-
-#### templates/deployment.yaml
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {{ include "chunk-asset.fullname" . }}
-  labels:
-    {{- include "chunk-asset.labels" . | nindent 4 }}
-spec:
-  {{- if not .Values.autoscaling.enabled }}
-  replicas: {{ .Values.replicaCount }}
-  {{- end }}
-  selector:
-    matchLabels:
-      {{- include "chunk-asset.selectorLabels" . | nindent 6 }}
-  template:
-    metadata:
-      labels:
-        {{- include "chunk-asset.selectorLabels" . | nindent 8 }}
-    spec:
-      containers:
-        - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          ports:
-            - name: http
-              containerPort: {{ .Values.service.targetPort }}
-              protocol: TCP
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 30
-            periodSeconds: 10
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: http
-            initialDelaySeconds: 5
-            periodSeconds: 5
-          resources:
-            {{- toYaml .Values.resources | nindent 12 }}
-          envFrom:
-            {{- if .Values.configMap.enabled }}
-            - configMapRef:
-                name: {{ include "chunk-asset.fullname" . }}-config
-            {{- end }}
-```
-
-### 5.3 Helm Deployment Commands
-
-```bash
-# Package Helm chart
-helm package ./chunk-asset -d ./dist
-
-# Upload to S3
-aws s3 cp ./dist/chunk-asset-1.0.0.tgz s3://pf-artifacts/idxp-mapchunk-svc/Release_QA/25.3.0.0/
-
-# Deploy to cluster
-helm upgrade --install chunk-asset ./chunk-asset \
-  --namespace purple-fabric \
-  --set image.repository=123456789012.dkr.ecr.us-east-1.amazonaws.com/chunk-asset \
-  --set image.tag=qa-25.3.0.0 \
-  --values ./environments/qa/values.yaml \
-  --wait --timeout 10m
-
-# Rollback if needed
-helm rollback chunk-asset 1 --namespace purple-fabric
+```json
+{
+  "version": "25.3.0.0",
+  "services": {
+    "chunk-asset": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/chunk-asset:qa-25.3.0.0",
+      "tag": "qa-25.3.0.0"
+    },
+    "chunk-init-asset": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/chunk-init-asset:qa-25.3.0.0",
+      "tag": "qa-25.3.0.0"
+    },
+    "embedding-gen-asset": {
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/embedding-gen-asset:qa-25.3.0.0",
+      "tag": "qa-25.3.0.0"
+    }
+  }
+}
 ```
 
 ---
 
-## 6. Jenkins Pipeline Reference
+## 5. Jenkins Pipeline Implementation
 
-### 6.1 Development Pipeline (Full CI/CD)
+### 5.1 Manifest Preparation Jenkinsfile
 
 ```groovy
+// Jenkinsfile: manifest-preparation-job
+// Location: idxp_map_infra_iac_svc/jenkins/manifest-preparation/Jenkinsfile
+
 pipeline {
-    agent {
-        kubernetes {
-            yaml """
-                apiVersion: v1
-                kind: Pod
-                spec:
-                  containers:
-                  - name: docker
-                    image: docker:20.10.16-dind
-                    securityContext:
-                      privileged: true
-                  - name: aws-cli
-                    image: amazon/aws-cli:2.7.16
-                    command: ['sleep']
-                    args: ['infinity']
-                  - name: sam-cli
-                    image: amazon/aws-sam-cli-build-image-python3.9:1.53.0
-                    command: ['sleep']
-                    args: ['infinity']
-            """
-        }
-    }
+    agent any
     
     parameters {
-        string(name: 'BRANCH_NAME', defaultValue: 'develop', description: 'Branch to build')
-        string(name: 'SERVICE_NAME', defaultValue: 'chunk-asset', description: 'Service name')
-        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip tests')
+        string(
+            name: 'VERSION', 
+            defaultValue: '', 
+            description: 'Release version (e.g., 25.3.0.0)'
+        )
+        choice(
+            name: 'TARGET_ENV', 
+            choices: ['qa', 'stg', 'prod'], 
+            description: 'Target environment'
+        )
+        string(
+            name: 'SERVICE_LIST', 
+            defaultValue: 'all', 
+            description: 'Comma-separated services or "all"'
+        )
+        string(
+            name: 'SOURCE_ENV', 
+            defaultValue: 'dev', 
+            description: 'Source environment for images'
+        )
+        booleanParam(
+            name: 'DRY_RUN', 
+            defaultValue: false, 
+            description: 'Validate only, do not store'
+        )
     }
     
     environment {
         AWS_REGION = 'us-east-1'
         ECR_REGISTRY = '123456789012.dkr.ecr.us-east-1.amazonaws.com'
-        SERVICE_NAME = "${params.SERVICE_NAME}"
-        BUILD_TAG = "${SERVICE_NAME}:dev-${params.BRANCH_NAME}-${BUILD_NUMBER}"
+        IAC_REPO = 'idxp_map_infra_iac_svc'
+        MANIFEST_DIR = 'manifests'
     }
     
     stages {
-        stage('Checkout') {
-            parallel {
-                stage('Service Code') {
-                    steps {
-                        checkout([
-                            $class: 'GitSCM',
-                            branches: [[name: "*/${params.BRANCH_NAME}"]],
-                            userRemoteConfigs: [[
-                                url: "https://git.company.com/services/${SERVICE_NAME}-service.git",
-                                credentialsId: 'git-credentials'
-                            ]]
-                        ])
+        stage('Validate Input') {
+            steps {
+                script {
+                    if (!params.VERSION?.trim()) {
+                        error "VERSION parameter is required"
+                    }
+                    
+                    // Validate version format
+                    if (!params.VERSION.matches(/^\d+\.\d+\.\d+\.\d+$/)) {
+                        error "VERSION must be in format X.X.X.X (e.g., 25.3.0.0)"
+                    }
+                    
+                    echo "📋 Preparing manifest for version: ${params.VERSION}"
+                    echo "🎯 Target environment: ${params.TARGET_ENV}"
+                }
+            }
+        }
+        
+        stage('Checkout IAC Repository') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${params.TARGET_ENV}"]],
+                    userRemoteConfigs: [[
+                        url: "https://git.company.com/iac/${IAC_REPO}.git",
+                        credentialsId: 'git-credentials'
+                    ]]
+                ])
+                
+                script {
+                    env.IAC_COMMIT = sh(
+                        script: 'git rev-parse HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Discover Services') {
+            steps {
+                script {
+                    def serviceList = []
+                    
+                    if (params.SERVICE_LIST == 'all') {
+                        // Auto-discover from IAC repo structure
+                        def services = sh(
+                            script: '''
+                                find services -mindepth 1 -maxdepth 1 -type d -exec basename {} \\; | sort
+                            ''',
+                            returnStdout: true
+                        ).trim().split('\n')
+                        serviceList = services.toList()
+                    } else {
+                        serviceList = params.SERVICE_LIST.split(',').collect { it.trim() }
+                    }
+                    
+                    env.SERVICES = serviceList.join(',')
+                    echo "📦 Services to process: ${env.SERVICES}"
+                }
+            }
+        }
+        
+        stage('Validate Images & Templates') {
+            steps {
+                script {
+                    def services = env.SERVICES.split(',')
+                    def manifest = [
+                        manifest_version: "1.0",
+                        release_version: params.VERSION,
+                        environment: params.TARGET_ENV,
+                        created_at: new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+                        created_by: "jenkins-manifest-job",
+                        build_number: env.BUILD_NUMBER,
+                        ecr_registry: env.ECR_REGISTRY,
+                        services: [:],
+                        errors: []
+                    ]
+                    
+                    services.each { serviceName ->
+                        echo "🔍 Validating: ${serviceName}"
+                        
+                        // Check ECR image exists
+                        def sourceTag = "${params.SOURCE_ENV}-develop-latest"
+                        def imageCheck = sh(
+                            script: """
+                                aws ecr describe-images \
+                                    --repository-name ${serviceName} \
+                                    --image-ids imageTag=${sourceTag} \
+                                    --region ${AWS_REGION} \
+                                    --query 'imageDetails[0].imageDigest' \
+                                    --output text 2>/dev/null || echo "NOT_FOUND"
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (imageCheck == "NOT_FOUND") {
+                            manifest.errors.add("Image not found: ${serviceName}:${sourceTag}")
+                            echo "❌ Image not found: ${serviceName}:${sourceTag}"
+                            return
+                        }
+                        
+                        // Check template exists
+                        def templatePath = "services/${serviceName}/lambda/${serviceName}/lambda/template.yaml"
+                        def templateExists = fileExists(templatePath)
+                        
+                        if (!templateExists) {
+                            manifest.errors.add("Template not found: ${templatePath}")
+                            echo "❌ Template not found: ${templatePath}"
+                            return
+                        }
+                        
+                        // Add to manifest
+                        def targetTag = "${params.TARGET_ENV}-${params.VERSION}"
+                        manifest.services[serviceName] = [
+                            image_uri: "${ECR_REGISTRY}/${serviceName}:${targetTag}",
+                            image_tag: targetTag,
+                            image_digest: imageCheck,
+                            source_tag: sourceTag,
+                            template_path: templatePath,
+                            config_version: params.VERSION
+                        ]
+                        
+                        echo "✅ Validated: ${serviceName}"
+                    }
+                    
+                    // Store manifest for later stages
+                    env.MANIFEST_JSON = groovy.json.JsonOutput.toJson(manifest)
+                    env.ERROR_COUNT = manifest.errors.size()
+                    
+                    // Write to file for inspection
+                    writeJSON file: "manifest-${params.VERSION}.json", json: manifest, pretty: 4
+                }
+            }
+        }
+        
+        stage('Check Validation Results') {
+            steps {
+                script {
+                    if (env.ERROR_COUNT.toInteger() > 0) {
+                        def manifest = readJSON text: env.MANIFEST_JSON
+                        echo "❌ Validation failed with ${env.ERROR_COUNT} errors:"
+                        manifest.errors.each { error ->
+                            echo "  - ${error}"
+                        }
+                        error "Manifest validation failed. Please fix the above issues."
+                    }
+                    
+                    echo "✅ All validations passed!"
+                }
+            }
+        }
+        
+        stage('Retag Images') {
+            when {
+                expression { !params.DRY_RUN }
+            }
+            steps {
+                script {
+                    def manifest = readJSON text: env.MANIFEST_JSON
+                    
+                    manifest.services.each { serviceName, serviceConfig ->
+                        echo "🏷️ Retagging: ${serviceName}"
+                        
+                        sh """
+                            # Get image manifest from source tag
+                            IMAGE_MANIFEST=\$(aws ecr batch-get-image \
+                                --repository-name ${serviceName} \
+                                --image-ids imageTag=${serviceConfig.source_tag} \
+                                --region ${AWS_REGION} \
+                                --query 'images[0].imageManifest' \
+                                --output text)
+                            
+                            # Put with new tag
+                            aws ecr put-image \
+                                --repository-name ${serviceName} \
+                                --image-tag ${serviceConfig.image_tag} \
+                                --image-manifest "\$IMAGE_MANIFEST" \
+                                --region ${AWS_REGION}
+                            
+                            echo "✅ Retagged ${serviceName}: ${serviceConfig.source_tag} → ${serviceConfig.image_tag}"
+                        """
                     }
                 }
-                stage('IAC Code') {
+            }
+        }
+        
+        stage('Store Manifest') {
+            when {
+                expression { !params.DRY_RUN }
+            }
+            parallel {
+                stage('Store in IAC Repo') {
                     steps {
-                        dir('iac') {
-                            checkout([
-                                $class: 'GitSCM',
-                                branches: [[name: "*/${params.BRANCH_NAME}"]],
-                                userRemoteConfigs: [[
-                                    url: 'https://git.company.com/iac/idxp_map_infra_iac_svc.git',
-                                    credentialsId: 'git-credentials'
-                                ]]
-                            ])
+                        script {
+                            sh """
+                                mkdir -p ${MANIFEST_DIR}/${params.VERSION}
+                                cp manifest-${params.VERSION}.json ${MANIFEST_DIR}/${params.VERSION}/lambda-manifest.json
+                                
+                                git config user.email "jenkins@company.com"
+                                git config user.name "Jenkins CI"
+                                git add ${MANIFEST_DIR}/
+                                git commit -m "Add manifest for version ${params.VERSION}" || true
+                                git push origin ${params.TARGET_ENV}
+                            """
+                        }
+                    }
+                }
+                
+                stage('Store in Parameter Store') {
+                    steps {
+                        script {
+                            def paramPath = "/PF/lambda/${params.VERSION}"
+                            
+                            sh """
+                                aws ssm put-parameter \
+                                    --name "${paramPath}" \
+                                    --value file://manifest-${params.VERSION}.json \
+                                    --type String \
+                                    --overwrite \
+                                    --region ${AWS_REGION}
+                                
+                                echo "✅ Stored manifest at: ${paramPath}"
+                            """
                         }
                     }
                 }
             }
         }
         
-        stage('Branch Validation') {
+        stage('Generate Report') {
             steps {
                 script {
-                    // Validate IAC files exist for this service
-                    sh """
-                        if [ ! -f "iac/services/${SERVICE_NAME}/jenkins/Jenkinsfile" ]; then
-                            echo "ERROR: Jenkinsfile not found for ${SERVICE_NAME}"
-                            exit 1
-                        fi
-                        
-                        if [ ! -f "iac/services/${SERVICE_NAME}/lambda/${SERVICE_NAME}/lambda/template.yaml" ]; then
-                            echo "ERROR: CloudFormation template not found"
-                            exit 1
-                        fi
-                        
-                        echo "✅ Branch validation passed"
+                    def manifest = readJSON text: env.MANIFEST_JSON
+                    def serviceCount = manifest.services.size()
+                    
+                    def summary = """
+╔════════════════════════════════════════════════════════════════╗
+║             MANIFEST PREPARATION COMPLETE                       ║
+╠════════════════════════════════════════════════════════════════╣
+║ Version:      ${params.VERSION.padRight(47)}║
+║ Environment:  ${params.TARGET_ENV.padRight(47)}║
+║ Services:     ${serviceCount.toString().padRight(47)}║
+║ Dry Run:      ${params.DRY_RUN.toString().padRight(47)}║
+╠════════════════════════════════════════════════════════════════╣
+║ Storage Locations:                                              ║
+║   • IAC Repo: manifests/${params.VERSION}/lambda-manifest.json${' '.padRight(20)}║
+║   • SSM:      /PF/lambda/${params.VERSION}${' '.padRight(30)}║
+╚════════════════════════════════════════════════════════════════╝
                     """
+                    
+                    echo summary
                 }
-            }
-        }
-        
-        stage('Unit Tests') {
-            when { not { expression { params.SKIP_TESTS } } }
-            steps {
-                sh '''
-                    pip install -r requirements.txt
-                    python -m pytest tests/ -v --junitxml=test-results.xml
-                '''
-                junit 'test-results.xml'
-            }
-        }
-        
-        stage('Docker Build & Push') {
-            steps {
-                container('docker') {
-                    script {
-                        sh """
-                            aws ecr get-login-password --region ${AWS_REGION} | \
-                                docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                            
-                            docker build -t ${BUILD_TAG} .
-                            docker tag ${BUILD_TAG} ${ECR_REGISTRY}/${BUILD_TAG}
-                            docker push ${ECR_REGISTRY}/${BUILD_TAG}
-                        """
-                        
-                        env.IMAGE_URI = "${ECR_REGISTRY}/${BUILD_TAG}"
-                    }
-                }
-            }
-        }
-        
-        stage('Deploy to Dev') {
-            steps {
-                container('sam-cli') {
-                    dir("iac/services/${SERVICE_NAME}/lambda/${SERVICE_NAME}/lambda") {
-                        sh """
-                            sam deploy \
-                                --template-file template.yaml \
-                                --stack-name ${SERVICE_NAME}-dev \
-                                --parameter-overrides ImageUri=${IMAGE_URI} EnvironmentType=dev \
-                                --capabilities CAPABILITY_IAM \
-                                --no-fail-on-empty-changeset
-                        """
-                    }
-                }
-            }
-        }
-        
-        stage('Smoke Test') {
-            steps {
-                sh '''
-                    aws lambda wait function-updated --function-name ${SERVICE_NAME}-dev
-                    aws lambda invoke --function-name ${SERVICE_NAME}-dev response.json
-                    cat response.json
-                '''
             }
         }
     }
     
     post {
         success {
-            slackSend channel: '#deployments', color: 'good',
-                message: "✅ ${SERVICE_NAME} deployed to dev successfully"
+            slackSend(
+                channel: '#deployments',
+                color: 'good',
+                message: """
+✅ *Manifest Preparation Successful*
+• Version: `${params.VERSION}`
+• Environment: `${params.TARGET_ENV}`
+• Build: #${env.BUILD_NUMBER}
+• Services: ${env.SERVICES}
+                """
+            )
         }
+        
         failure {
-            slackSend channel: '#deployments', color: 'danger',
-                message: "❌ ${SERVICE_NAME} deployment failed"
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: """
+❌ *Manifest Preparation Failed*
+• Version: `${params.VERSION}`
+• Environment: `${params.TARGET_ENV}`
+• Build: #${env.BUILD_NUMBER}
+• Check: ${env.BUILD_URL}
+                """
+            )
+        }
+        
+        always {
+            archiveArtifacts artifacts: 'manifest-*.json', allowEmptyArchive: true
         }
     }
 }
 ```
 
-### 6.2 QA Promotion Pipeline (CD Only)
+### 5.2 Manifest Deployment Jenkinsfile
 
 ```groovy
+// Jenkinsfile: manifest-deployment-job
+// Location: idxp_map_infra_iac_svc/jenkins/manifest-deployment/Jenkinsfile
+
 pipeline {
     agent any
     
     parameters {
-        string(name: 'VERSION', defaultValue: '25.3.0.0', description: 'Release version')
-        string(name: 'SERVICE_NAME', description: 'Service to promote (or "all")')
+        string(name: 'VERSION', description: 'Manifest version to deploy')
+        choice(name: 'ENVIRONMENT', choices: ['qa', 'stg', 'prod'])
+        string(name: 'SERVICE_NAME', defaultValue: 'all', description: 'Service to deploy or "all"')
     }
     
     environment {
         AWS_REGION = 'us-east-1'
-        ECR_REGISTRY = '123456789012.dkr.ecr.us-east-1.amazonaws.com'
     }
     
     stages {
-        stage('Validate Dev Images') {
+        stage('Fetch Manifest') {
             steps {
                 script {
-                    // Check dev images exist
-                    sh """
-                        aws ecr describe-images \
-                            --repository-name ${params.SERVICE_NAME} \
-                            --image-ids imageTag=dev-develop-latest \
-                            --region ${AWS_REGION}
-                    """
-                }
-            }
-        }
-        
-        stage('Generate Manifest') {
-            steps {
-                script {
-                    def manifest = [
-                        version: params.VERSION,
-                        services: [:]
-                    ]
+                    def paramPath = "/PF/lambda/${params.VERSION}"
                     
-                    // Get image details
-                    def imageUri = sh(
-                        script: "aws ecr describe-images --repository-name ${params.SERVICE_NAME} --image-ids imageTag=dev-develop-latest --query 'imageDetails[0].imageDigest' --output text",
+                    env.MANIFEST_JSON = sh(
+                        script: """
+                            aws ssm get-parameter \
+                                --name "${paramPath}" \
+                                --query 'Parameter.Value' \
+                                --output text \
+                                --region ${AWS_REGION}
+                        """,
                         returnStdout: true
                     ).trim()
                     
-                    manifest.services[params.SERVICE_NAME] = [
-                        image_uri: "${ECR_REGISTRY}/${params.SERVICE_NAME}:qa-${params.VERSION}",
-                        digest: imageUri
-                    ]
+                    writeJSON file: 'manifest.json', text: env.MANIFEST_JSON
                     
-                    writeJSON file: "manifest-${params.VERSION}.json", json: manifest
+                    echo "📋 Fetched manifest for version: ${params.VERSION}"
                 }
             }
         }
         
-        stage('Retag Images for QA') {
+        stage('Pre-Deployment Checks') {
             steps {
-                sh """
-                    # Get manifest from dev image
-                    MANIFEST=\$(aws ecr batch-get-image \
-                        --repository-name ${params.SERVICE_NAME} \
-                        --image-ids imageTag=dev-develop-latest \
-                        --query 'images[0].imageManifest' \
-                        --output text)
+                script {
+                    def manifest = readJSON text: env.MANIFEST_JSON
                     
-                    # Retag as QA
-                    aws ecr put-image \
-                        --repository-name ${params.SERVICE_NAME} \
-                        --image-tag qa-${params.VERSION} \
-                        --image-manifest "\$MANIFEST"
-                """
-            }
-        }
-        
-        stage('Store Manifest') {
-            parallel {
-                stage('IAC Repo') {
-                    steps {
+                    manifest.services.each { serviceName, config ->
+                        if (params.SERVICE_NAME != 'all' && params.SERVICE_NAME != serviceName) {
+                            return
+                        }
+                        
+                        echo "🔍 Checking: ${serviceName}"
+                        
+                        // Verify image exists
                         sh """
-                            git checkout qa
-                            cp manifest-${params.VERSION}.json manifests/${params.VERSION}/
-                            git add .
-                            git commit -m "Add manifest for ${params.VERSION}"
-                            git push origin qa
+                            aws ecr describe-images \
+                                --repository-name ${serviceName} \
+                                --image-ids imageTag=${config.image_tag} \
+                                --region ${AWS_REGION}
                         """
-                    }
-                }
-                stage('Parameter Store') {
-                    steps {
-                        sh """
-                            aws ssm put-parameter \
-                                --name "/PF/lambda/${params.VERSION}" \
-                                --value file://manifest-${params.VERSION}.json \
-                                --type String \
-                                --overwrite
-                        """
+                        
+                        echo "✅ ${serviceName} - Image verified"
                     }
                 }
             }
         }
         
-        stage('Deploy to QA') {
+        stage('Deploy Services') {
             steps {
-                build job: 'QA-Lambda-Deploy', parameters: [
-                    string(name: 'VERSION', value: params.VERSION),
-                    string(name: 'SERVICE_NAME', value: params.SERVICE_NAME)
-                ]
+                script {
+                    def manifest = readJSON text: env.MANIFEST_JSON
+                    
+                    manifest.services.each { serviceName, config ->
+                        if (params.SERVICE_NAME != 'all' && params.SERVICE_NAME != serviceName) {
+                            return
+                        }
+                        
+                        echo "🚀 Deploying: ${serviceName}"
+                        
+                        // Deploy using SAM
+                        dir("services/${serviceName}/lambda/${serviceName}/lambda") {
+                            sh """
+                                sam deploy \
+                                    --template-file template.yaml \
+                                    --stack-name ${serviceName}-${params.ENVIRONMENT} \
+                                    --parameter-overrides \
+                                        ImageUri=${config.image_uri} \
+                                        EnvironmentType=${params.ENVIRONMENT} \
+                                    --capabilities CAPABILITY_IAM \
+                                    --no-fail-on-empty-changeset \
+                                    --region ${AWS_REGION}
+                            """
+                        }
+                        
+                        echo "✅ Deployed: ${serviceName}"
+                    }
+                }
             }
+        }
+        
+        stage('Post-Deployment Validation') {
+            steps {
+                script {
+                    def manifest = readJSON text: env.MANIFEST_JSON
+                    
+                    manifest.services.each { serviceName, config ->
+                        if (params.SERVICE_NAME != 'all' && params.SERVICE_NAME != serviceName) {
+                            return
+                        }
+                        
+                        // Wait for function to be ready
+                        sh """
+                            aws lambda wait function-updated \
+                                --function-name ${serviceName}-${params.ENVIRONMENT} \
+                                --region ${AWS_REGION}
+                            
+                            aws lambda get-function \
+                                --function-name ${serviceName}-${params.ENVIRONMENT} \
+                                --query 'Configuration.State' \
+                                --output text \
+                                --region ${AWS_REGION}
+                        """
+                        
+                        echo "✅ ${serviceName} - Health check passed"
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo "🎉 Deployment completed successfully!"
+        }
+        failure {
+            echo "❌ Deployment failed. Check logs for details."
         }
     }
 }
@@ -991,520 +1051,179 @@ pipeline {
 
 ---
 
-## 7. Cross-Account ECR Configuration
+## 6. Storage & Distribution
 
-### 7.1 Central Account Setup
+### 6.1 Storage Locations
+
+| Location | Path | Purpose | Access |
+|----------|------|---------|--------|
+| **IAC Repository** | `manifests/{VERSION}/` | Version control, audit trail | Git |
+| **Parameter Store** | `/PF/lambda/{VERSION}` | Runtime deployment access | IAM |
+| **Parameter Store** | `/PF/k8s/{VERSION}` | K8s manifest | IAM |
+| **Parameter Store** | `/Fabric/lambda/{VERSION}` | Fabric services | IAM |
+
+### 6.2 Parameter Store Commands
+
+```bash
+# Store manifest
+aws ssm put-parameter \
+    --name "/PF/lambda/25.3.0.0" \
+    --value file://lambda-manifest-25.3.0.0.json \
+    --type String \
+    --overwrite
+
+# Retrieve manifest
+aws ssm get-parameter \
+    --name "/PF/lambda/25.3.0.0" \
+    --query 'Parameter.Value' \
+    --output text > manifest.json
+
+# List all manifests
+aws ssm get-parameters-by-path \
+    --path "/PF/lambda/" \
+    --query 'Parameters[].Name'
+```
+
+---
+
+## 7. Validation & Verification
+
+### 7.1 Manifest Validation Script
 
 ```bash
 #!/bin/bash
-# setup_central_ecr.sh
+# validate_manifest.sh
 
-CENTRAL_ACCOUNT="123456789012"
-REGION="us-east-1"
-SERVICES=("chunk-asset" "chunk-init-asset" "embedding-gen-asset" "embedding-init-asset")
+MANIFEST_FILE=$1
+ENVIRONMENT=$2
 
-for SERVICE in "${SERVICES[@]}"; do
-    echo "Creating ECR repository: ${SERVICE}"
+echo "🔍 Validating manifest: ${MANIFEST_FILE}"
+
+# Check JSON validity
+if ! jq empty "${MANIFEST_FILE}" 2>/dev/null; then
+    echo "❌ Invalid JSON format"
+    exit 1
+fi
+
+echo "✅ JSON format valid"
+
+# Check required fields
+VERSION=$(jq -r '.release_version' "${MANIFEST_FILE}")
+if [ -z "$VERSION" ] || [ "$VERSION" == "null" ]; then
+    echo "❌ Missing release_version"
+    exit 1
+fi
+
+echo "✅ Version: ${VERSION}"
+
+# Validate each service
+SERVICES=$(jq -r '.services | keys[]' "${MANIFEST_FILE}")
+
+for SERVICE in $SERVICES; do
+    echo "🔍 Validating service: ${SERVICE}"
     
-    aws ecr create-repository \
-        --repository-name ${SERVICE} \
-        --image-scanning-configuration scanOnPush=true \
-        --region ${REGION}
+    IMAGE_URI=$(jq -r ".services[\"${SERVICE}\"].image_uri" "${MANIFEST_FILE}")
+    IMAGE_TAG=$(jq -r ".services[\"${SERVICE}\"].image_tag" "${MANIFEST_FILE}")
     
-    # Set lifecycle policy
-    aws ecr put-lifecycle-policy \
-        --repository-name ${SERVICE} \
-        --lifecycle-policy-text file://lifecycle-policy.json \
-        --region ${REGION}
+    # Check image exists in ECR
+    REPO_NAME=$(echo $IMAGE_URI | sed 's/.*\///' | cut -d: -f1)
+    
+    aws ecr describe-images \
+        --repository-name "$REPO_NAME" \
+        --image-ids imageTag="$IMAGE_TAG" \
+        --query 'imageDetails[0].imagePushedAt' \
+        --output text > /dev/null 2>&1
+    
+    if [ $? -eq 0 ]; then
+        echo "  ✅ Image exists: ${IMAGE_TAG}"
+    else
+        echo "  ❌ Image not found: ${IMAGE_TAG}"
+        exit 1
+    fi
+done
+
+echo ""
+echo "✅ Manifest validation complete!"
+```
+
+### 7.2 Compare Manifests Script
+
+```bash
+#!/bin/bash
+# compare_manifests.sh
+
+MANIFEST_1=$1
+MANIFEST_2=$2
+
+echo "📊 Comparing manifests..."
+echo "  File 1: ${MANIFEST_1}"
+echo "  File 2: ${MANIFEST_2}"
+echo ""
+
+# Get versions
+V1=$(jq -r '.release_version' "${MANIFEST_1}")
+V2=$(jq -r '.release_version' "${MANIFEST_2}")
+
+echo "Versions: ${V1} vs ${V2}"
+echo ""
+
+# Compare services
+SERVICES_1=$(jq -r '.services | keys[]' "${MANIFEST_1}" | sort)
+SERVICES_2=$(jq -r '.services | keys[]' "${MANIFEST_2}" | sort)
+
+echo "Services comparison:"
+diff <(echo "$SERVICES_1") <(echo "$SERVICES_2")
+
+# Compare tags
+echo ""
+echo "Image tag changes:"
+for SERVICE in $SERVICES_1; do
+    TAG_1=$(jq -r ".services[\"${SERVICE}\"].image_tag" "${MANIFEST_1}")
+    TAG_2=$(jq -r ".services[\"${SERVICE}\"].image_tag" "${MANIFEST_2}")
+    
+    if [ "$TAG_1" != "$TAG_2" ]; then
+        echo "  ${SERVICE}: ${TAG_1} → ${TAG_2}"
+    fi
 done
 ```
 
-### 7.2 Target Account IAM Role
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchGetImage",
-        "ecr:BatchCheckLayerAvailability"
-      ],
-      "Resource": "arn:aws:ecr:us-east-1:123456789012:repository/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": "ecr:GetAuthorizationToken",
-      "Resource": "*"
-    }
-  ]
-}
-```
-
-### 7.3 Cross-Account Trust Policy
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::CENTRAL-ACCOUNT:role/JenkinsDeploymentRole"
-      },
-      "Action": "sts:AssumeRole",
-      "Condition": {
-        "StringEquals": {
-          "sts:ExternalId": "deployment-external-id"
-        }
-      }
-    }
-  ]
-}
-```
-
 ---
 
-## 8. Manifest System
+## 8. Troubleshooting
 
-### 8.1 Manifest File Structure
-
-```json
-{
-  "version": "25.3.0.0",
-  "release_date": "2025-12-13",
-  "environment": "qa",
-  "services": {
-    "chunk-asset": {
-      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/chunk-asset:qa-25.3.0.0",
-      "digest": "sha256:abc123...",
-      "config_version": "25.3.0.0",
-      "dependencies": ["chunk-init-asset"]
-    },
-    "chunk-init-asset": {
-      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/chunk-init-asset:qa-25.3.0.0",
-      "digest": "sha256:def456...",
-      "config_version": "25.3.0.0"
-    },
-    "embedding-gen-asset": {
-      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/embedding-gen-asset:qa-25.3.0.0",
-      "digest": "sha256:ghi789..."
-    }
-  },
-  "infrastructure": {
-    "lambda_templates": "s3://iac-artifacts/lambda/25.3.0.0/",
-    "helm_charts": "s3://iac-artifacts/k8s/25.3.0.0/",
-    "parameter_store_path": "/PF/25.3.0.0/"
-  }
-}
-```
-
-### 8.2 Manifest Storage Locations
-
-| Location | Purpose | Access |
-|----------|---------|--------|
-| **IAC Repo (master branch)** | Audit history, version control | Git access |
-| **Parameter Store** | Runtime deployment access | IAM-based |
-| **S3** | Backup, artifact distribution | Cross-account |
-
-### 8.3 Parameter Store Paths
-
-```
-/PF/lambda/25.3.0.0     # Lambda manifest for v25.3.0.0
-/PF/k8s/25.3.0.0        # K8s manifest for v25.3.0.0
-/Fabric/lambda/25.3.0.0 # Fabric Lambda manifest
-/Fabric/k8s/25.3.0.0    # Fabric K8s manifest
-```
-
----
-
-## 9. Environment Promotion Workflow
-
-### 9.1 Promotion Flow Diagram
-
-```mermaid
-stateDiagram-v2
-    [*] --> Development
-    Development --> QA: Code Complete (Retag: dev → qa)
-    QA --> iaiautomation: QA Sign-off
-    iaiautomation --> Staging: Automation Tests Pass
-    Staging --> Production: Staging Validated
-    Production --> [*]: Release Complete
-    
-    QA --> Development: Issues Found
-    Staging --> QA: Staging Issues
-    Production --> Staging: Rollback Required
-```
-
-### 9.2 Retagging Commands
-
-```bash
-# Dev → QA Promotion
-SOURCE_TAG="dev-develop-latest"
-TARGET_TAG="qa-25.3.0.0"
-REPO="chunk-asset"
-
-# Get manifest
-MANIFEST=$(aws ecr batch-get-image \
-    --repository-name $REPO \
-    --image-ids imageTag=$SOURCE_TAG \
-    --query 'images[0].imageManifest' \
-    --output text)
-
-# Retag
-aws ecr put-image \
-    --repository-name $REPO \
-    --image-tag $TARGET_TAG \
-    --image-manifest "$MANIFEST"
-
-# QA → Staging Promotion
-aws ecr put-image \
-    --repository-name $REPO \
-    --image-tag stg-25.3.0.0 \
-    --image-manifest "$MANIFEST"
-
-# Staging → Production Promotion
-aws ecr put-image \
-    --repository-name $REPO \
-    --image-tag prod-25.3.0.0 \
-    --image-manifest "$MANIFEST"
-```
-
-### 9.3 Pre-Deployment Validation Checklist
-
-```yaml
-pre_deployment_checks:
-  - name: "Image Availability"
-    command: "aws ecr describe-images --repository-name {service} --image-ids imageTag={tag}"
-    
-  - name: "Template Exists"
-    command: "test -f iac/services/{service}/lambda/{service}/lambda/template.yaml"
-    
-  - name: "Parameter Store Config"
-    command: "aws ssm get-parameter --name /PF/{env}/{service}/config"
-    
-  - name: "Dependencies Available"
-    command: "check_dependencies.sh {service}"
-    
-  - name: "Manifest Consistency"
-    command: "validate_manifest.sh {version}"
-```
-
----
-
-## 10. MAP Ticket Governance Process
-
-### 10.1 Process Flow
-
-```mermaid
-flowchart TD
-    A[Developer Request] --> B[Create MAP Ticket]
-    B --> C[Cloud Enablement Review]
-    C --> D{Approved?}
-    D -->|Yes| E[Sync iaiautomation Environment]
-    D -->|No| F[Request Modification]
-    F --> B
-    E --> G[Create INFRA Ticket]
-    G --> H[Deploy to Other Environments]
-    H --> I[Deployment Complete]
-```
-
-### 10.2 MAP Ticket Template
-
-| Field | Description | Example |
-|-------|-------------|---------|
-| **Service Type** | Create / Update / Delete | Create |
-| **AWS Service Name** | Specific AWS service | Lambda, EKS |
-| **Environment** | Target environment | Automation → Dev → QA → Prod |
-| **Service Description** | What to provision/change | "Create new Lambda for chunk processing" |
-| **Business Justification** | Why needed | "Support new document processing feature" |
-| **Required Configurations** | VPC, IAM, etc. | VPC: vpc-123, Subnet: subnet-456 |
-| **Attachments** | Design docs, IaC refs | Link to architecture document |
-
-### 10.3 SLA by Complexity
-
-| Category | Complexity | SLA | Examples |
-|----------|------------|-----|----------|
-| **1** | Simple | 1-3 Days | S3 buckets, IAM roles, simple Lambda |
-| **2** | Medium | 3-5 Days | POC services, simple integrations |
-| **3** | Complex | 5-10 Days | Cross-account setups, multi-service |
-
-### 10.4 Covered Services
-
-**AWS Services:**
-- Compute & Containers (EC2, Lambda, EKS, ECS)
-- Networking & Storage (VPC, S3, EFS)
-- Databases & Messaging (RDS, DynamoDB, SQS, SNS)
-- Security & AI (IAM, KMS, SageMaker, Bedrock)
-
-**Third-Party Services:**
-- MongoDB Atlas
-- HashiCorp Vault & Consul
-- Elasticsearch
-- DockerHub
-
----
-
-## 11. Service Onboarding Procedures
-
-### 11.1 Lambda Service Onboarding
-
-```mermaid
-sequenceDiagram
-    participant Dev as Developer
-    participant DevSecOps as DevSecOps Team
-    participant IAC as IAC Repository
-    participant Jenkins as Jenkins
-    
-    Dev->>DevSecOps: Request Lambda onboarding
-    DevSecOps->>IAC: Create service folder structure
-    DevSecOps->>IAC: Create template.yaml
-    DevSecOps->>IAC: Create Jenkinsfile
-    DevSecOps->>IAC: Create buildspec.yml
-    DevSecOps->>Jenkins: Create Jenkins jobs
-    DevSecOps->>Dev: Handover documentation
-    Dev->>Jenkins: Trigger first deployment
-```
-
-#### Onboarding Checklist
-
-- [ ] Create service folder in IAC repo
-- [ ] Create Lambda CloudFormation template
-- [ ] Create Jenkinsfile for CI/CD
-- [ ] Create buildspec.yml for CodeBuild
-- [ ] Set up Parameter Store entries
-- [ ] Configure SQS queues (if needed)
-- [ ] Set up ECR repository
-- [ ] Create Jenkins jobs (dev, qa, stg, prod)
-- [ ] Document deployment procedure
-- [ ] Handover to development team
-
-### 11.2 Kubernetes Service Onboarding
-
-#### Onboarding Checklist
-
-- [ ] Create service folder in IAC repo
-- [ ] Create Helm chart (Chart.yaml, values.yaml, templates/)
-- [ ] Create Jenkinsfile
-- [ ] Create environment-specific values files
-- [ ] Configure Docker Hub / ECR access
-- [ ] Set up KEDA scaled objects (if needed)
-- [ ] Configure Ingress rules
-- [ ] Create ConfigMaps/Secrets
-- [ ] Create Jenkins jobs
-- [ ] Document deployment procedure
-
----
-
-## 12. Operational Runbooks
-
-### 12.1 Rollback Procedure
-
-```bash
-#!/bin/bash
-# rollback.sh
-
-SERVICE_NAME=$1
-TARGET_VERSION=$2
-ENVIRONMENT=$3
-
-echo "Rolling back ${SERVICE_NAME} to ${TARGET_VERSION} in ${ENVIRONMENT}"
-
-# Get previous manifest
-MANIFEST=$(aws ssm get-parameter \
-    --name "/PF/lambda/${TARGET_VERSION}" \
-    --query 'Parameter.Value' \
-    --output text)
-
-IMAGE_URI=$(echo $MANIFEST | jq -r ".services[\"${SERVICE_NAME}\"].image_uri")
-
-# Update Lambda function
-aws lambda update-function-code \
-    --function-name ${SERVICE_NAME}-${ENVIRONMENT} \
-    --image-uri ${IMAGE_URI}
-
-# Wait for update
-aws lambda wait function-updated \
-    --function-name ${SERVICE_NAME}-${ENVIRONMENT}
-
-echo "✅ Rollback complete"
-```
-
-### 12.2 Health Check Script
-
-```bash
-#!/bin/bash
-# health_check.sh
-
-SERVICE_NAME=$1
-ENVIRONMENT=$2
-
-# Check Lambda function
-STATUS=$(aws lambda get-function \
-    --function-name ${SERVICE_NAME}-${ENVIRONMENT} \
-    --query 'Configuration.State' \
-    --output text)
-
-if [ "$STATUS" == "Active" ]; then
-    echo "✅ ${SERVICE_NAME} is healthy"
-    
-    # Test invocation
-    aws lambda invoke \
-        --function-name ${SERVICE_NAME}-${ENVIRONMENT} \
-        --payload '{"test": true}' \
-        response.json
-    
-    cat response.json
-else
-    echo "❌ ${SERVICE_NAME} is in state: ${STATUS}"
-    exit 1
-fi
-```
-
-### 12.3 Image Cleanup Script
-
-```bash
-#!/bin/bash
-# cleanup_ecr.sh
-
-REPO_NAME=$1
-KEEP_COUNT=10
-
-# Get all image tags
-IMAGES=$(aws ecr describe-images \
-    --repository-name $REPO_NAME \
-    --query 'imageDetails[?imageTags!=`null`]|sort_by(@, &imagePushedAt)' \
-    --output json)
-
-# Count images
-TOTAL=$(echo $IMAGES | jq length)
-
-if [ $TOTAL -gt $KEEP_COUNT ]; then
-    DELETE_COUNT=$((TOTAL - KEEP_COUNT))
-    
-    echo "Deleting $DELETE_COUNT old images..."
-    
-    # Get images to delete
-    DELETE_IMAGES=$(echo $IMAGES | jq -r ".[:${DELETE_COUNT}][].imageDigest")
-    
-    for DIGEST in $DELETE_IMAGES; do
-        aws ecr batch-delete-image \
-            --repository-name $REPO_NAME \
-            --image-ids imageDigest=$DIGEST
-    done
-fi
-```
-
----
-
-## 13. Troubleshooting Guide
-
-### 13.1 Common Issues
+### 8.1 Common Issues
 
 | Issue | Cause | Solution |
 |-------|-------|----------|
-| **ECR Access Denied** | Missing cross-account permissions | Verify ECR resource policy includes target account |
-| **Branch Validation Failure** | IAC/Service branch mismatch | Ensure same branch exists in both repos |
-| **Lambda Timeout** | Image pull slow | Check VPC endpoints, consider regional ECR |
-| **Manifest Not Found** | Parameter Store path wrong | Verify path: `/PF/lambda/{version}` |
-| **Helm Deploy Failure** | Values mismatch | Check values.yaml and environment overrides |
+| Image not found | Dev build not pushed | Run dev pipeline first |
+| Template not found | Service not in IAC repo | Add template.yaml to IAC |
+| Retag failed | Image already exists with tag | Use --force or different version |
+| SSM access denied | Missing IAM permissions | Check role has ssm:PutParameter |
+| Manifest mismatch | SSM and IAC repo differ | Re-run manifest preparation |
 
-### 13.2 Debug Commands
-
-```bash
-# Check ECR permissions
-aws ecr get-repository-policy --repository-name chunk-asset
-
-# List image tags
-aws ecr list-images --repository-name chunk-asset
-
-# Check Lambda configuration
-aws lambda get-function --function-name chunk-asset-dev
-
-# View CloudFormation stack events
-aws cloudformation describe-stack-events --stack-name chunk-asset-dev
-
-# Check Parameter Store
-aws ssm get-parameters-by-path --path /PF/dev/ --recursive
-
-# Verify Helm release
-helm list -n purple-fabric
-helm history chunk-asset -n purple-fabric
-```
-
----
-
-## 14. Appendix: Code Templates
-
-### 14.1 Dockerfile Template
-
-```dockerfile
-FROM python:3.9-slim as builder
-
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
-
-FROM python:3.9-slim
-
-WORKDIR /app
-
-COPY --from=builder /root/.local /root/.local
-COPY src/ ./src/
-
-RUN useradd --create-home app
-USER app
-
-ENV PYTHONPATH=/app/src
-ENV PATH=/root/.local/bin:$PATH
-
-EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=10s CMD python -c "import requests; requests.get('http://localhost:8080/health')"
-
-CMD ["python", "src/main.py"]
-```
-
-### 14.2 Parameter Store Setup Script
+### 8.2 Debug Commands
 
 ```bash
-#!/bin/bash
-# setup_parameters.sh
+# List all images for a service
+aws ecr describe-images \
+    --repository-name chunk-asset \
+    --query 'imageDetails[*].[imageTags,imagePushedAt]' \
+    --output table
 
-AWS_REGION="us-east-1"
-ENVIRONMENT=$1
+# Check manifest in Parameter Store
+aws ssm get-parameter \
+    --name "/PF/lambda/25.3.0.0" \
+    --query 'Parameter.Value' \
+    --output text | jq .
 
-echo "Setting up Parameter Store for ${ENVIRONMENT}..."
+# Verify service count
+jq '.services | keys | length' manifest.json
 
-params=(
-    "/PF/${ENVIRONMENT}/vpc/vpc-id:vpc-12345abcde"
-    "/PF/${ENVIRONMENT}/vpc/private-subnet-1:subnet-abc123"
-    "/PF/${ENVIRONMENT}/vpc/private-subnet-2:subnet-def456"
-    "/PF/${ENVIRONMENT}/database/host:postgres-${ENVIRONMENT}.cluster.amazonaws.com"
-    "/PF/${ENVIRONMENT}/redis/endpoint:redis-${ENVIRONMENT}.cache.amazonaws.com:6379"
-    "/PF/${ENVIRONMENT}/logging/level:INFO"
-)
-
-for param in "${params[@]}"; do
-    NAME="${param%%:*}"
-    VALUE="${param#*:}"
-    
-    aws ssm put-parameter \
-        --name "$NAME" \
-        --value "$VALUE" \
-        --type String \
-        --overwrite \
-        --region ${AWS_REGION}
-done
-
-echo "✅ Parameter Store setup complete"
+# List all manifests
+aws ssm get-parameters-by-path \
+    --path "/PF/" \
+    --recursive \
+    --query 'Parameters[?contains(Name, `manifest`)].Name'
 ```
 
 ---
@@ -1513,12 +1232,10 @@ echo "✅ Parameter Store setup complete"
 
 | Property | Value |
 |----------|-------|
-| **Version** | 3.0 |
-| **Last Updated** | December 13, 2025 |
-| **Review Cycle** | Monthly |
+| **Version** | 1.0 |
+| **Created** | December 13, 2025 |
 | **Owner** | Cloud Enablement & Governance Team |
-| **Contacts** | Sabarinath S, Selva Priya |
-| **Approval** | Madhavan |
+| **Review Cycle** | Monthly |
 
 ---
 
